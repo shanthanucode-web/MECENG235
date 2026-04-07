@@ -1,76 +1,145 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- |
+| Supported Targets | ESP32 |
+| ----------------- | ----- |
 
-# UART Echo Example
+# UART LED Command Lab
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+This project is an ESP32 lab app built from the UART echo example and adapted to control an LED from UART commands typed in the ESP-IDF monitor.
 
-This example demonstrates how to utilize UART interfaces by echoing back to the sender any data received on
-configured UART.
+## What This Project Does
 
-## How to use example
+The firmware listens for single-character UART commands and changes the LED behavior on `GPIO13`.
 
-### Hardware Required
+Current command set:
 
-The example can be run on any development board, that is based on the Espressif SoC. The board shall be connected to a computer with a single USB cable for flashing and monitoring. The external interface should have 3.3V outputs. You may
-use e.g. 3.3V compatible USB-to-Serial dongle.
+- `I`: connection check, LED stays on, monitor prints `CONNECTED`
+- `E`: easy mode, LED blinks slowly, monitor prints `EASY`
+- `H`: hard mode, LED blinks faster, monitor prints `HARD`
+- `S`: stop the active blink mode and return to idle, monitor prints `IDLE`
+- `X`: exit the program until reset/reflash, monitor prints `EXITED`
 
-### Setup the Hardware
+Important note:
 
-Connect the external serial interface to the board as follows.
+- Commands are uppercase characters. In the monitor, that means `Shift+I`, `Shift+E`, `Shift+H`, `Shift+S`, and `Shift+X`.
 
-```
-  -----------------------------------------------------------------------------------------
-  | Target chip Interface | Kconfig Option     | Default ESP Pin      | External UART Pin |
-  | ----------------------|--------------------|----------------------|--------------------
-  | Transmit Data (TxD)   | EXAMPLE_UART_TXD   | GPIO4                | RxD               |
-  | Receive Data (RxD)    | EXAMPLE_UART_RXD   | GPIO5                | TxD               |
-  | Ground                | n/a                | GND                  | GND               |
-  -----------------------------------------------------------------------------------------
-```
-Note: Some GPIOs can not be used with certain chips because they are reserved for internal use. Please refer to UART documentation for selected target.
+## Current Firmware Behavior
 
-Optionally, you can set-up and use a serial interface that has RTS and CTS signals in order to verify that the
-hardware control flow works. Connect the extra signals according to the following table, configure both extra pins in
-the example code `uart_echo_example_main.c` by replacing existing `UART_PIN_NO_CHANGE` macros with the appropriate pin
-numbers and configure UART1 driver to use the hardware flow control by setting `.flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS`
-and adding `.rx_flow_ctrl_thresh = 122` to the `uart_config` structure.
+- The LED is connected to `GPIO13`.
+- The UART command interface is currently configured to use `UART0`.
+- The current UART pins from `sdkconfig` are:
+  - `TX = GPIO1`
+  - `RX = GPIO3`
+  - `Baud rate = 115200`
+- Because this project is currently using `UART0`, the same ESP-IDF monitor window used for flashing can also be used to send commands.
+- The current blink timing in code is:
+  - Easy mode: `500 ms` between toggles
+  - Hard mode: `100 ms` between toggles
 
-```
-  ---------------------------------------------------------------
-  | Target chip Interface | Macro           | External UART Pin |
-  | ----------------------|-----------------|--------------------
-  | Transmit Data (TxD)   | ECHO_TEST_RTS   | CTS               |
-  | Receive Data (RxD)    | ECHO_TEST_CTS   | RTS               |
-  | Ground                | n/a             | GND               |
-  ---------------------------------------------------------------
-```
+## Project Structure
 
-### Configure the project
+- `main/uart_echo_example_main.c`: main application logic, UART command handling, LED state machine
+- `main/Kconfig.projbuild`: project menuconfig options for UART selection, baud rate, and task stack
+- `sdkconfig`: current resolved build configuration for this local project
+- `CMakeLists.txt` and `main/CMakeLists.txt`: ESP-IDF build setup
 
-Use the command below to configure project using Kconfig menu as showed in the table above.
-The default Kconfig values can be changed such as: EXAMPLE_TASK_STACK_SIZE, EXAMPLE_UART_BAUD_RATE, EXAMPLE_UART_PORT_NUM (Refer to Kconfig file).
-```
-idf.py menuconfig
-```
+## Setup Requirements
 
-### Build and Flash
+Each teammate needs:
 
-Build the project and flash it to the board, then run monitor tool to view serial output:
+- ESP-IDF installed and sourced in the terminal
+- An ESP32 development board
+- A USB cable connected to the board
 
-```
+If `idf.py` is not recognized, the ESP-IDF environment has not been loaded in that terminal yet.
+
+## How To Run
+
+### 1. Open the project
+
+Open this repository in your editor or terminal.
+
+### 2. Load the ESP-IDF environment
+
+Use your local ESP-IDF setup command before building. This step depends on where ESP-IDF is installed on your machine.
+
+### 3. Build and flash
+
+Run:
+
+```bash
 idf.py -p PORT flash monitor
 ```
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+Replace `PORT` with your board port, for example `/dev/cu.usbserial-0001` or similar on macOS.
 
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
+This command:
 
-## Example Output
+- builds the firmware
+- flashes it to the ESP32
+- opens the serial monitor
 
-Type some characters in the terminal connected to the external serial interface. As result you should see echo in the same terminal which you used for typing the characters. You can verify if the echo indeed comes from ESP board by
-disconnecting either `TxD` or `RxD` pin: no characters will appear when typing.
+To exit the monitor, press `Ctrl-]`.
+
+## How To Use In The Monitor
+
+Once the monitor is open:
+
+1. Press `Shift+I` to verify communication and turn the LED on.
+2. Press `Shift+E` to enter easy mode and blink slowly.
+3. Press `Shift+H` to enter hard mode and blink quickly.
+4. Press `Shift+S` to stop blinking and return to idle.
+5. Press `Shift+X` to exit the firmware logic until the board is reset or reflashed.
+
+Expected monitor responses:
+
+- `I` -> `CONNECTED`
+- `E` -> `EASY`
+- `H` -> `HARD`
+- `S` -> `IDLE`
+- `X` -> `EXITED`
+
+## Important Workflow Note
+
+Changing the source code in the editor does not change the ESP32 by itself.
+
+After every code change, you must rebuild and reflash:
+
+```bash
+idf.py -p PORT flash monitor
+```
+
+If you forget to reflash, the board will keep running the old firmware.
+
+## What We Changed From The Original Example
+
+This is no longer a plain UART echo example.
+
+We changed it to:
+
+- use a command-driven LED control flow
+- add explicit firmware states for idle, connected, easy, hard, and exited behavior
+- replace the old incremental blink-speed logic with fixed easy/hard modes
+- use monitor-visible UART status messages for each command
+- use the current `UART0` console configuration so commands can be typed directly in the ESP-IDF monitor
 
 ## Troubleshooting
 
-You are not supposed to see the echo in the terminal which is used for flashing and monitoring, but in the other UART configured through Kconfig can be used.
+### `idf.py: command not found`
+
+Your ESP-IDF environment is not loaded in the current terminal. Source ESP-IDF first, then rerun the flash command.
+
+### LED behavior does not match your latest code
+
+You likely edited the file but did not rebuild and reflash. Flash again.
+
+### Nothing happens when typing commands
+
+Check:
+
+- you are typing uppercase letters
+- the board is still running and not already in `EXITED`
+- the correct serial port is being used
+- the firmware was flashed successfully
+
+### `X` was pressed and now no commands work
+
+That is expected. `X` is terminal in the current lab design. Reset the board or flash again to continue testing.

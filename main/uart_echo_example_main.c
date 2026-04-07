@@ -7,79 +7,114 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 #include <stdio.h>
-#include "string.h"
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "sdkconfig.h"
-#include "esp_log.h"
 
 /**
- * This is an example which echos any data it receives on configured UART back to the sender,
- * with hardware flow control turned off. It does not use UART driver event queue.
+ * This example receives command bytes on the configured UART and updates the
+ * board state accordingly.
  *
- * - Port: configured UART
- * - Receive (Rx) buffer: on
- * - Transmit (Tx) buffer: off
- * - Flow control: off
- * - Event queue: off
- * - Pin assignment: see defines below (See Kconfig)
+ * Supported commands:
+ * - I: force the LED on to confirm the UART link is working
+ * - E: enter easy mode and blink slowly
+ * - H: enter hard mode and blink quickly
+ * - S: stop the active mode and return to idle
+ * - X: exit the program until the board is reset or reflashed
  */
- #define CONFIG_EXAMPLE_UART_BAUD_RATE 115200
 
+#define ECHO_TEST_TXD          CONFIG_EXAMPLE_UART_TXD
+#define ECHO_TEST_RXD          CONFIG_EXAMPLE_UART_RXD
+#define ECHO_TEST_RTS          UART_PIN_NO_CHANGE
+#define ECHO_TEST_CTS          UART_PIN_NO_CHANGE
+#define ECHO_UART_PORT_NUM     CONFIG_EXAMPLE_UART_PORT_NUM
+#define ECHO_UART_BAUD_RATE    CONFIG_EXAMPLE_UART_BAUD_RATE
+#define ECHO_TASK_STACK_SIZE   CONFIG_EXAMPLE_TASK_STACK_SIZE
 
-#define ECHO_TEST_TXD (CONFIG_EXAMPLE_UART_TXD)
-#define ECHO_TEST_RXD (CONFIG_EXAMPLE_UART_RXD)
-#define ECHO_TEST_RTS (UART_PIN_NO_CHANGE)
-#define ECHO_TEST_CTS (UART_PIN_NO_CHANGE)
+#define LED_GPIO               GPIO_NUM_13
+#define BUF_SIZE               1024
+#define EASY_BLINK_PERIOD_MS   500
+#define HARD_BLINK_PERIOD_MS   100
+#define IDLE_POLL_PERIOD_MS    50
 
-#define ECHO_UART_PORT_NUM      (CONFIG_EXAMPLE_UART_PORT_NUM)
-#define ECHO_UART_BAUD_RATE     (CONFIG_EXAMPLE_UART_BAUD_RATE)
-#define ECHO_TASK_STACK_SIZE    (CONFIG_EXAMPLE_TASK_STACK_SIZE)
+typedef enum {
+    BOARD_STATE_IDLE = 0,
+    BOARD_STATE_CONNECTED,
+    BOARD_STATE_EASY,
+    BOARD_STATE_HARD,
+    BOARD_STATE_EXITED,
+} board_state_t;
 
-#define DEFAULT_PERIOD 1000
-
+static volatile board_state_t s_board_state = BOARD_STATE_IDLE;
 static uint8_t s_led_state = 1;
 
-static uint32_t flash_period = DEFAULT_PERIOD;
-static uint32_t flash_period_dec = DEFAULT_PERIOD/10;
-
-
-TaskHandle_t myTaskHandle = NULL;
-
-#define BUF_SIZE (1024)
-
-static void blink_led(void)
+static void set_led(bool on)
 {
-    /* Set the GPIO level according to the state (LOW or HIGH)*/
-    gpio_set_level(13, s_led_state);
+    s_led_state = on ? 1 : 0;
+    gpio_set_level(LED_GPIO, s_led_state);
+}
+
+static void toggle_led(void)
+{
+    s_led_state = !s_led_state;
+    gpio_set_level(LED_GPIO, s_led_state);
+}
+
+static void uart_send_line(const char *message)
+{
+    uart_write_bytes(ECHO_UART_PORT_NUM, message, strlen(message));
+    uart_write_bytes(ECHO_UART_PORT_NUM, "\r\n", 2);
 }
 
 static void blink_task(void *arg)
 {
-    while(1)
-    {
-    s_led_state = !s_led_state;
-    blink_led();
-    vTaskDelay(flash_period/ portTICK_PERIOD_MS);
-    }
+    while (1) {
+        board_state_t state = s_board_state;
 
+        switch (state) {
+        case BOARD_STATE_IDLE:
+            set_led(true);
+            vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_PERIOD_MS));
+            break;
+
+        case BOARD_STATE_CONNECTED:
+            set_led(true);
+            vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_PERIOD_MS));
+            break;
+
+        case BOARD_STATE_EASY:
+            toggle_led();
+            vTaskDelay(pdMS_TO_TICKS(EASY_BLINK_PERIOD_MS));
+            break;
+
+        case BOARD_STATE_HARD:
+            toggle_led();
+            vTaskDelay(pdMS_TO_TICKS(HARD_BLINK_PERIOD_MS));
+            break;
+
+        case BOARD_STATE_EXITED:
+            set_led(false);
+            vTaskDelete(NULL);
+            break;
+        }
+    }
 }
 
 static void echo_task(void *arg)
 {
-    /* Configure parameters of an UART driver,
-     * communication pins and install the driver */
     uart_config_t uart_config = {
         .baud_rate = ECHO_UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
+        .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
     int intr_alloc_flags = 0;
+    uint8_t data[BUF_SIZE];
 
 #if CONFIG_UART_ISR_IN_IRAM
     intr_alloc_flags = ESP_INTR_FLAG_IRAM;
@@ -89,54 +124,63 @@ static void echo_task(void *arg)
     ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
 
-    // Configure a temporary buffer for the incoming data
-    uint8_t *data = (uint8_t *) malloc(BUF_SIZE);
+    uart_send_line("READY: I E H S X");
 
-    uart_write_bytes(ECHO_UART_PORT_NUM, "Commands", strlen("Commands"));
-    while (1)
-    {
-        // Read data from the UART
-        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, (BUF_SIZE - 1), 20 / portTICK_PERIOD_MS);
-        // Write data back to the UART
-        uart_write_bytes(ECHO_UART_PORT_NUM, (const char *) data, len);
-        if (len)
-        {
-            data[len] = '\0';
-            switch(data[0])
-            {
-                case 'I':
-                    s_led_state = 1;
-                    blink_led();
-                    uart_write_bytes(ECHO_UART_PORT_NUM, "ESP32", strlen("ESP32"));
-                    break;
-                case 'T':
-                    flash_period -= flash_period_dec;
-                    if(flash_period <= flash_period_dec) flash_period = flash_period_dec;
-                    break;
-                case 'A':
-                    vTaskResume(myTaskHandle);
-                    break;
-                case 'B':
-                    vTaskSuspend(myTaskHandle);
-                    break;
-                case 'R':
-                    flash_period = DEFAULT_PERIOD;
-                    break;
-                default:
-                    break;
+    while (1) {
+        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, BUF_SIZE - 1, pdMS_TO_TICKS(20));
+
+        if (len <= 0) {
+            continue;
+        }
+
+        data[len] = '\0';
+
+        switch (data[0]) {
+        case 'I':
+            s_board_state = BOARD_STATE_CONNECTED;
+            set_led(true);
+            uart_send_line("CONNECTED");
+            break;
+
+        case 'E':
+            s_board_state = BOARD_STATE_EASY;
+            uart_send_line("EASY");
+            break;
+
+        case 'H':
+            s_board_state = BOARD_STATE_HARD;
+            uart_send_line("HARD");
+            break;
+
+        case 'S':
+            if (s_board_state == BOARD_STATE_EASY || s_board_state == BOARD_STATE_HARD) {
+                s_board_state = BOARD_STATE_IDLE;
+                set_led(true);
+                uart_send_line("IDLE");
+            } else {
+                uart_send_line("ALREADY IDLE");
             }
+            break;
+
+        case 'X':
+            s_board_state = BOARD_STATE_EXITED;
+            uart_send_line("EXITED");
+            vTaskDelete(NULL);
+            break;
+
+        default:
+            uart_send_line("UNKNOWN COMMAND");
+            break;
         }
     }
 }
 
 void app_main(void)
 {
-    gpio_reset_pin(13);
-    /* Set the GPIO as a push/pull output */
-    gpio_set_direction(13, GPIO_MODE_OUTPUT);
-    blink_led();
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    set_led(false);
 
     xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
-    xTaskCreate(blink_task, "blink_LED", 1024, NULL, 5, &myTaskHandle);
-    vTaskSuspend(myTaskHandle);
+    xTaskCreate(blink_task, "blink_led_task", 2048, NULL, 5, NULL);
 }
