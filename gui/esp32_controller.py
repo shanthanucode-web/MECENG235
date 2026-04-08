@@ -1,9 +1,9 @@
 """
-ESP32 LED Controller GUI
+Haptic Surgical Skill Trainer — Lab 4 Dev Interface
 PySide6 host-side application for the uart_echo_VitalSignsLab4 project.
 
 Communicates with the ESP32 over USB-serial (115200 baud).
-Supported commands: I (Init), E (Easy), H (Hard), S (Stop), X (Exit)
+Supported commands: I (Identify), E (Easy), H (Hard), S (Stop), X (Exit)
 """
 
 import queue
@@ -14,13 +14,16 @@ from enum import Enum
 import serial
 import serial.tools.list_ports
 from PySide6.QtCore import (
+    QPauseAnimation,
     QPropertyAnimation,
+    QSequentialAnimationGroup,
     QThread,
     QEasingCurve,
     Signal,
     Slot,
     Qt,
     QSize,
+    Property,
 )
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import (
@@ -51,19 +54,19 @@ class BoardState(Enum):
 
 
 STATE_COLORS: dict[BoardState, str] = {
-    BoardState.IDLE:      "#555566",
-    BoardState.CONNECTED: "#00E676",
-    BoardState.EASY:      "#C6FF00",
-    BoardState.HARD:      "#FF6D00",
-    BoardState.EXITED:    "#F44336",
+    BoardState.IDLE:      "#3D4455",
+    BoardState.CONNECTED: "#00BCD4",
+    BoardState.EASY:      "#FF8F00",
+    BoardState.HARD:      "#D32F2F",
+    BoardState.EXITED:    "#5C1010",
 }
 
 STATE_LABELS: dict[BoardState, str] = {
-    BoardState.IDLE:      "IDLE",
-    BoardState.CONNECTED: "CONNECTED",
+    BoardState.IDLE:      "STANDBY",
+    BoardState.CONNECTED: "TRAINER ONLINE",
     BoardState.EASY:      "EASY MODE",
     BoardState.HARD:      "HARD MODE",
-    BoardState.EXITED:    "EXITED",
+    BoardState.EXITED:    "SESSION ENDED",
 }
 
 RESPONSE_TO_STATE: dict[str, BoardState] = {
@@ -77,27 +80,39 @@ RESPONSE_TO_STATE: dict[str, BoardState] = {
 
 
 # ---------------------------------------------------------------------------
-# LED indicator widget
+# Vitals-style indicator widget
 # ---------------------------------------------------------------------------
 
 class LedIndicator(QWidget):
-    """Painted circular indicator that pulses in EASY / HARD mode."""
+    """Heartbeat-rhythm indicator. Pulses like a vitals monitor in EASY/HARD."""
 
-    SIZE = 22
+    SIZE = 28
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedSize(self.SIZE, self.SIZE)
         self._state = BoardState.IDLE
-        self._glow = 0.0           # 0.0 – 1.0, animated in EASY/HARD
+        self._glow  = 1.0
 
-        self._anim = QPropertyAnimation(self, b"glow_level", self)
-        self._anim.setEasingCurve(QEasingCurve.Type.SineCurve)
-        self._anim.setStartValue(0.15)
-        self._anim.setEndValue(1.0)
-        self._anim.setLoopCount(-1)
+        # Beat animations: fast rise → decay → pause (heartbeat feel)
+        self._beat_rise = QPropertyAnimation(self, b"glow_level")
+        self._beat_rise.setEasingCurve(QEasingCurve.Type.OutQuad)
+        self._beat_rise.setStartValue(0.05)
+        self._beat_rise.setEndValue(1.0)
 
-    # Qt property for animation
+        self._beat_fall = QPropertyAnimation(self, b"glow_level")
+        self._beat_fall.setEasingCurve(QEasingCurve.Type.InQuad)
+        self._beat_fall.setStartValue(1.0)
+        self._beat_fall.setEndValue(0.05)
+
+        self._beat_pause = QPauseAnimation()
+
+        self._anim_group = QSequentialAnimationGroup(self)
+        self._anim_group.setLoopCount(-1)
+        self._anim_group.addAnimation(self._beat_rise)
+        self._anim_group.addAnimation(self._beat_fall)
+        self._anim_group.addAnimation(self._beat_pause)
+
     def _get_glow(self) -> float:
         return self._glow
 
@@ -105,21 +120,23 @@ class LedIndicator(QWidget):
         self._glow = value
         self.update()
 
-    glow_level = property(_get_glow, _set_glow)
-
-    # Make it a Qt property so QPropertyAnimation works
-    from PySide6.QtCore import Property as _Prop
-    glow_level = _Prop(float, _get_glow, _set_glow)
+    glow_level = Property(float, _get_glow, _set_glow)
 
     def set_state(self, state: BoardState) -> None:
         self._state = state
-        self._anim.stop()
+        self._anim_group.stop()
         if state == BoardState.EASY:
-            self._anim.setDuration(900)
-            self._anim.start()
+            # Slow heartbeat ~60 bpm
+            self._beat_rise.setDuration(150)
+            self._beat_fall.setDuration(250)
+            self._beat_pause.setDuration(600)
+            self._anim_group.start()
         elif state == BoardState.HARD:
-            self._anim.setDuration(200)
-            self._anim.start()
+            # Urgent rhythm ~140 bpm
+            self._beat_rise.setDuration(80)
+            self._beat_fall.setDuration(150)
+            self._beat_pause.setDuration(200)
+            self._anim_group.start()
         else:
             self._glow = 1.0
         self.update()
@@ -129,39 +146,46 @@ class LedIndicator(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         color = QColor(STATE_COLORS[self._state])
-        cx, cy, r = self.SIZE / 2, self.SIZE / 2, self.SIZE / 2 - 2
+        cx, cy, r = self.SIZE / 2, self.SIZE / 2, self.SIZE / 2 - 3
 
-        # Glow halo
+        # Outer glow ring (pulsing states)
         if self._state in (BoardState.EASY, BoardState.HARD):
-            halo = QRadialGradient(cx, cy, r * 1.8)
+            halo = QRadialGradient(cx, cy, r * 2.0)
             glow_color = QColor(color)
-            glow_color.setAlphaF(self._glow * 0.35)
+            glow_color.setAlphaF(self._glow * 0.40)
             halo.setColorAt(0.0, glow_color)
             halo.setColorAt(1.0, QColor(0, 0, 0, 0))
             painter.setBrush(halo)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(int(cx - r * 1.8), int(cy - r * 1.8),
-                                int(r * 3.6), int(r * 3.6))
+            painter.drawEllipse(int(cx - r * 2.0), int(cy - r * 2.0),
+                                int(r * 4.0), int(r * 4.0))
 
-        # Main circle
-        painter.setPen(QPen(color.darker(150), 1))
+        # Border ring
+        ring_color = QColor(color)
+        ring_color.setAlphaF(0.55)
+        painter.setPen(QPen(ring_color, 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(int(cx - r - 2), int(cy - r - 2),
+                            int((r + 2) * 2), int((r + 2) * 2))
+
+        # Main filled circle
+        painter.setPen(QPen(color.darker(160), 1))
         fill_color = QColor(color)
         if self._state in (BoardState.EASY, BoardState.HARD):
-            fill_color.setAlphaF(0.4 + self._glow * 0.6)
+            fill_color.setAlphaF(0.35 + self._glow * 0.65)
         painter.setBrush(fill_color)
         painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
 
         # Specular highlight
-        highlight = QColor(255, 255, 255, 80)
-        painter.setBrush(highlight)
+        painter.setBrush(QColor(255, 255, 255, 60))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(int(cx - r * 0.45), int(cy - r * 0.55),
-                            int(r * 0.5), int(r * 0.4))
+        painter.drawEllipse(int(cx - r * 0.40), int(cy - r * 0.50),
+                            int(r * 0.45), int(r * 0.35))
         painter.end()
 
 
 # ---------------------------------------------------------------------------
-# Serial worker thread
+# Serial worker thread  (logic unchanged)
 # ---------------------------------------------------------------------------
 
 class SerialWorker(QThread):
@@ -214,59 +238,98 @@ class SerialWorker(QThread):
 def _hline() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet("color: #2A2A3F;")
+    line.setStyleSheet("color: #121E30;")
     return line
 
 
+def _section_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setObjectName("section_header")
+    return lbl
+
+
 # ---------------------------------------------------------------------------
-# Main window
+# Stylesheet — surgical dark instrument panel
 # ---------------------------------------------------------------------------
 
 STYLESHEET = """
 QMainWindow, QWidget#central {
-    background-color: #1E1E2E;
+    background-color: #080C14;
+}
+
+QWidget#sensor_panel {
+    background-color: #0B1220;
+    border: 1px solid #1A2E48;
 }
 
 QLabel {
-    color: #CDD6F4;
+    color: #B0C8DC;
     font-size: 13px;
 }
 
 QLabel#title {
-    color: #CDD6F4;
-    font-size: 18px;
+    color: #D8EEFF;
+    font-size: 17px;
     font-weight: bold;
-    letter-spacing: 1px;
+    letter-spacing: 3px;
+}
+
+QLabel#section_header {
+    color: #1E5E7A;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 2.5px;
 }
 
 QLabel#state_label {
-    color: #CDD6F4;
-    font-size: 22px;
+    color: #D8EEFF;
+    font-size: 20px;
+    font-weight: bold;
+    letter-spacing: 3px;
+}
+
+QLabel#badge {
+    border-radius: 2px;
+    padding: 2px 9px;
+    font-size: 10px;
     font-weight: bold;
     letter-spacing: 2px;
 }
 
-QLabel#badge {
-    border-radius: 6px;
-    padding: 2px 10px;
-    font-size: 11px;
+QLabel#sensor_key {
+    color: #2A5870;
+    font-size: 10px;
     font-weight: bold;
+    letter-spacing: 1.5px;
+}
+
+QLabel#sensor_val {
+    color: #00ACC1;
+    font-size: 16px;
+    font-weight: bold;
+    font-family: "Courier New", "Menlo", monospace;
+}
+
+QLabel#sensor_unit {
+    color: #1E5070;
+    font-size: 10px;
     letter-spacing: 1px;
 }
 
 QComboBox {
-    background-color: #2D2D44;
-    color: #CDD6F4;
-    border: 1px solid #45475A;
-    border-radius: 6px;
+    background-color: #0B1828;
+    color: #90B8CC;
+    border: 1px solid #1A3450;
+    border-radius: 2px;
     padding: 4px 10px;
-    font-size: 13px;
+    font-size: 12px;
     min-width: 220px;
 }
 QComboBox QAbstractItemView {
-    background-color: #2D2D44;
-    color: #CDD6F4;
-    selection-background-color: #5C6BC0;
+    background-color: #0B1828;
+    color: #90B8CC;
+    selection-background-color: #14385C;
+    border: 1px solid #1A3450;
 }
 QComboBox::drop-down {
     border: none;
@@ -274,83 +337,117 @@ QComboBox::drop-down {
 }
 
 QPushButton {
-    background-color: #2D2D44;
-    color: #CDD6F4;
-    border: 1px solid #45475A;
-    border-radius: 8px;
-    padding: 6px 14px;
-    font-size: 13px;
+    background-color: #0B1828;
+    color: #6898B4;
+    border: 1px solid #1A3450;
+    border-radius: 2px;
+    padding: 5px 12px;
+    font-size: 12px;
 }
 QPushButton:hover {
-    background-color: #3D3D60;
-    border-color: #5C6BC0;
+    background-color: #102235;
+    border-color: #2A6080;
+    color: #A0C8E0;
 }
 QPushButton:pressed {
-    background-color: #1A1A30;
+    background-color: #060C18;
 }
 QPushButton:disabled {
-    color: #585B70;
-    border-color: #313244;
-    background-color: #1E1E2E;
+    color: #162030;
+    border-color: #0E1C2C;
+    background-color: #080C14;
 }
 
 QPushButton#btn_connect {
-    background-color: #2D2D44;
-    color: #A6E3A1;
-    border-color: #A6E3A1;
+    background-color: #071814;
+    color: #00BFA5;
+    border: 1px solid #007A6A;
+    border-radius: 2px;
     font-weight: bold;
-    min-width: 110px;
+    letter-spacing: 1px;
+    min-width: 115px;
 }
 QPushButton#btn_connect:hover {
-    background-color: #1B5E20;
-    border-color: #A6E3A1;
+    background-color: #0A2820;
+    border-color: #00E5CC;
+    color: #1DE9B6;
 }
 QPushButton#btn_connect[connected="true"] {
-    background-color: #1B5E20;
-    color: #A6E3A1;
+    background-color: #0A2820;
+    color: #1DE9B6;
+    border-color: #00BFA5;
 }
 
 QPushButton#btn_cmd {
-    background-color: #31314D;
-    color: #CDD6F4;
-    border-color: #5C6BC0;
-    font-size: 14px;
+    background-color: #0A1828;
+    color: #6898B4;
+    border: 1px solid #1A4060;
+    border-radius: 2px;
+    font-size: 12px;
     font-weight: bold;
-    min-height: 44px;
-    min-width: 90px;
-    border-radius: 10px;
+    letter-spacing: 1px;
+    min-height: 52px;
+    min-width: 92px;
 }
 QPushButton#btn_cmd:hover {
-    background-color: #5C6BC0;
-    color: #FFFFFF;
+    background-color: #0E2840;
+    border-color: #00BCD4;
+    color: #00E5FF;
+}
+QPushButton#btn_cmd:pressed {
+    background-color: #060E1A;
 }
 
 QPushButton#btn_exit {
-    background-color: #2D1B1B;
-    color: #F38BA8;
-    border-color: #B71C1C;
-    font-size: 14px;
+    background-color: #180808;
+    color: #B05060;
+    border: 1px solid #6A1414;
+    border-radius: 2px;
+    font-size: 12px;
     font-weight: bold;
-    min-height: 44px;
-    min-width: 90px;
-    border-radius: 10px;
+    letter-spacing: 1px;
+    min-height: 52px;
+    min-width: 92px;
 }
 QPushButton#btn_exit:hover {
-    background-color: #B71C1C;
-    color: #FFFFFF;
+    background-color: #280A0A;
+    border-color: #C62828;
+    color: #EF5350;
+}
+QPushButton#btn_exit:pressed {
+    background-color: #0E0404;
 }
 
 QTextEdit#log {
-    background-color: #12121C;
-    color: #BAC2DE;
-    border: 1px solid #2A2A3F;
-    border-radius: 8px;
+    background-color: #040810;
+    color: #4A7890;
+    border: 1px solid #0E1E30;
+    border-radius: 0px;
     padding: 8px;
-    font-family: "Menlo", "Courier New", monospace;
+    font-family: "Courier New", "Menlo", monospace;
     font-size: 12px;
+}
+
+QScrollBar:vertical {
+    background: #060A12;
+    width: 6px;
+    border: none;
+    margin: 0px;
+}
+QScrollBar::handle:vertical {
+    background: #1A3450;
+    border-radius: 3px;
+    min-height: 16px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
 }
 """
 
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -359,15 +456,15 @@ class MainWindow(QMainWindow):
         self._cmd_queue: queue.Queue = queue.Queue()
         self._connected = False
 
-        self.setWindowTitle("ESP32 LED Controller")
-        self.setMinimumSize(QSize(560, 620))
+        self.setWindowTitle("Haptic Surgical Skill Trainer — Lab 4 Dev Interface")
+        self.setMinimumSize(QSize(580, 720))
 
         central = QWidget()
         central.setObjectName("central")
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setContentsMargins(24, 20, 24, 20)
+        root.setContentsMargins(24, 18, 24, 18)
         root.setSpacing(0)
 
         self._build_header(root)
@@ -376,13 +473,15 @@ class MainWindow(QMainWindow):
         self._build_connection_bar(root)
         root.addSpacing(14)
         root.addWidget(_hline())
-        root.addSpacing(16)
+        root.addSpacing(14)
         self._build_state_panel(root)
-        root.addSpacing(16)
+        root.addSpacing(12)
+        self._build_sensor_data(root)
+        root.addSpacing(14)
         root.addWidget(_hline())
-        root.addSpacing(16)
+        root.addSpacing(14)
         self._build_command_buttons(root)
-        root.addSpacing(16)
+        root.addSpacing(14)
         root.addWidget(_hline())
         root.addSpacing(10)
         self._build_log(root)
@@ -395,14 +494,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_header(self, root: QVBoxLayout) -> None:
-        title = QLabel("ESP32  LED  CONTROLLER")
+        title = QLabel("HAPTIC SURGICAL SKILL TRAINER")
         title.setObjectName("title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(title)
-        root.addSpacing(4)
-        sub = QLabel("uart_echo_VitalSignsLab4  ·  Core 0: UART  ·  Core 1: LED")
+        root.addSpacing(5)
+        sub = QLabel("ESP32 HUZZAH32  ·  UART Echo  ·  115200 baud")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setStyleSheet("color: #585B70; font-size: 11px; letter-spacing: 0.5px;")
+        sub.setStyleSheet("color: #1E4A62; font-size: 11px; letter-spacing: 1px;")
         root.addWidget(sub)
         root.addSpacing(14)
 
@@ -423,7 +522,7 @@ class MainWindow(QMainWindow):
         row.addWidget(refresh_btn)
 
         baud_lbl = QLabel("115200")
-        baud_lbl.setStyleSheet("color: #585B70; font-size: 12px; padding: 0 4px;")
+        baud_lbl.setStyleSheet("color: #1E4A62; font-size: 11px; padding: 0 4px;")
         row.addWidget(baud_lbl)
 
         row.addStretch()
@@ -437,36 +536,85 @@ class MainWindow(QMainWindow):
         root.addLayout(row)
 
     def _build_state_panel(self, root: QVBoxLayout) -> None:
+        root.addWidget(_section_label("TRAINER STATE"))
+        root.addSpacing(8)
+
         row = QHBoxLayout()
         row.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        row.setSpacing(14)
+        row.setSpacing(16)
 
         self._led_indicator = LedIndicator()
         row.addWidget(self._led_indicator)
 
-        self._state_label = QLabel("IDLE")
+        self._state_label = QLabel("STANDBY")
         self._state_label.setObjectName("state_label")
         row.addWidget(self._state_label)
 
         self._badge = QLabel("IDLE")
         self._badge.setObjectName("badge")
         self._badge.setStyleSheet(
-            f"background-color: #2D2D44; color: {STATE_COLORS[BoardState.IDLE]};"
-            " border-radius: 6px; padding: 2px 10px; font-size: 11px; font-weight: bold;"
+            f"background-color: #0B1220; color: {STATE_COLORS[BoardState.IDLE]};"
+            " border: 1px solid #1A2E48; border-radius: 2px;"
+            " padding: 2px 9px; font-size: 10px; font-weight: bold; letter-spacing: 2px;"
         )
         row.addWidget(self._badge)
 
         root.addLayout(row)
 
+    def _build_sensor_data(self, root: QVBoxLayout) -> None:
+        """Placeholder sensor data panel — not yet wired to live data."""
+        panel = QWidget()
+        panel.setObjectName("sensor_panel")
+        panel.setFixedHeight(74)
+
+        inner = QHBoxLayout(panel)
+        inner.setContentsMargins(16, 10, 16, 10)
+        inner.setSpacing(0)
+
+        for metric, value, unit in [
+            ("FORCE L",  "--",  "N"),
+            ("FORCE R",  "--",  "N"),
+            ("TREMOR",   "--",  "mm/s"),
+        ]:
+            col = QVBoxLayout()
+            col.setSpacing(3)
+            col.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            key_lbl = QLabel(metric)
+            key_lbl.setObjectName("sensor_key")
+            key_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            val_row = QHBoxLayout()
+            val_row.setSpacing(3)
+            val_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            val_lbl = QLabel(value)
+            val_lbl.setObjectName("sensor_val")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            unit_lbl = QLabel(unit)
+            unit_lbl.setObjectName("sensor_unit")
+            unit_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+            val_row.addWidget(val_lbl)
+            val_row.addWidget(unit_lbl)
+
+            col.addWidget(key_lbl)
+            col.addLayout(val_row)
+            inner.addLayout(col)
+            inner.addStretch()
+
+        # Remove trailing stretch
+        inner.takeAt(inner.count() - 1)
+
+        root.addWidget(panel)
+
     def _build_command_buttons(self, root: QVBoxLayout) -> None:
-        lbl = QLabel("COMMANDS")
-        lbl.setStyleSheet("color: #585B70; font-size: 11px; letter-spacing: 1px;")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(lbl)
+        root.addWidget(_section_label("TRAINER COMMANDS"))
         root.addSpacing(10)
 
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(8)
         row.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         def _cmd_btn(key: str, label: str, tooltip: str, obj_name: str = "btn_cmd") -> QPushButton:
@@ -480,25 +628,23 @@ class MainWindow(QMainWindow):
         self._cmd_buttons: list[QPushButton] = []
 
         for key, label, tip in [
-            ("I", "INIT",  "Confirm connection · LED on"),
-            ("E", "EASY",  "Slow blink · 500 ms"),
-            ("H", "HARD",  "Fast blink · 100 ms"),
-            ("S", "STOP",  "Stop blinking · return to idle"),
+            ("I", "IDENTIFY", "Confirm connection · LED on"),
+            ("E", "EASY",     "Easy training mode · slow blink · 500 ms"),
+            ("H", "HARD",     "Hard training mode · fast blink · 100 ms"),
+            ("S", "STOP",     "Stop active mode · return to idle"),
         ]:
             btn = _cmd_btn(key, label, tip)
             self._cmd_buttons.append(btn)
             row.addWidget(btn)
 
-        exit_btn = _cmd_btn("X", "EXIT", "Terminate firmware · requires reset", "btn_exit")
+        exit_btn = _cmd_btn("X", "EXIT", "Terminate session · requires reset to resume", "btn_exit")
         self._cmd_buttons.append(exit_btn)
         row.addWidget(exit_btn)
 
         root.addLayout(row)
 
     def _build_log(self, root: QVBoxLayout) -> None:
-        lbl = QLabel("SERIAL LOG")
-        lbl.setStyleSheet("color: #585B70; font-size: 11px; letter-spacing: 1px;")
-        root.addWidget(lbl)
+        root.addWidget(_section_label("SERIAL MONITOR"))
         root.addSpacing(6)
 
         self._log_view = QTextEdit()
@@ -510,7 +656,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self._log_view)
 
     # ------------------------------------------------------------------
-    # Port management
+    # Port management  (logic unchanged)
     # ------------------------------------------------------------------
 
     @Slot()
@@ -529,7 +675,7 @@ class MainWindow(QMainWindow):
             self._port_combo.addItem("No ports found", userData=None)
 
     # ------------------------------------------------------------------
-    # Connection
+    # Connection  (logic unchanged)
     # ------------------------------------------------------------------
 
     @Slot()
@@ -575,7 +721,7 @@ class MainWindow(QMainWindow):
         self._log("Disconnected.", "sys")
 
     # ------------------------------------------------------------------
-    # Slots
+    # Slots  (logic unchanged)
     # ------------------------------------------------------------------
 
     @Slot(str)
@@ -599,7 +745,7 @@ class MainWindow(QMainWindow):
             self._disconnect()
 
     # ------------------------------------------------------------------
-    # Commands
+    # Commands  (logic unchanged)
     # ------------------------------------------------------------------
 
     def _send_command(self, cmd: str) -> None:
@@ -618,9 +764,10 @@ class MainWindow(QMainWindow):
         color = STATE_COLORS[state]
         self._badge.setText(state.value)
         self._badge.setStyleSheet(
-            f"background-color: #2D2D44; color: {color};"
-            " border-radius: 6px; padding: 2px 10px;"
-            " font-size: 11px; font-weight: bold; letter-spacing: 1px;"
+            f"background-color: #0B1220; color: {color};"
+            f" border: 1px solid {color}40;"
+            " border-radius: 2px; padding: 2px 9px;"
+            " font-size: 10px; font-weight: bold; letter-spacing: 2px;"
         )
         if state == BoardState.EXITED:
             self._set_commands_enabled(False)
@@ -636,19 +783,19 @@ class MainWindow(QMainWindow):
     def _log(self, text: str, direction: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         if direction == "tx":
-            line = f'<span style="color:#89DCEB;">[{ts}]  &gt;&gt;  {text}</span>'
+            line = f'<span style="color:#4DD0E1;">[{ts}]  &gt;&gt;  {text}</span>'
         elif direction == "rx":
-            line = f'<span style="color:#A6E3A1;">[{ts}]  &lt;&lt;  {text}</span>'
+            line = f'<span style="color:#26A69A;">[{ts}]  &lt;&lt;  {text}</span>'
         elif direction == "err":
-            line = f'<span style="color:#F38BA8;">[{ts}]  !!  {text}</span>'
+            line = f'<span style="color:#EF5350;">[{ts}]  !!  {text}</span>'
         else:
-            line = f'<span style="color:#585B70;">[{ts}]  --  {text}</span>'
+            line = f'<span style="color:#263B4A;">[{ts}]  --  {text}</span>'
         self._log_view.append(line)
         sb = self._log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     # ------------------------------------------------------------------
-    # Cleanup
+    # Cleanup  (logic unchanged)
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
@@ -665,7 +812,7 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
-    font = QFont("Inter", 13)
+    font = QFont("Inter", 12)
     font.setStyleHint(QFont.StyleHint.SansSerif)
     app.setFont(font)
     window = MainWindow()
