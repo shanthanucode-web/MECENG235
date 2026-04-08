@@ -70,12 +70,14 @@ STATE_LABELS: dict[BoardState, str] = {
 }
 
 RESPONSE_TO_STATE: dict[str, BoardState] = {
-    "CONNECTED":    BoardState.CONNECTED,
-    "EASY":         BoardState.EASY,
-    "HARD":         BoardState.HARD,
-    "IDLE":         BoardState.IDLE,
-    "ALREADY IDLE": BoardState.CONNECTED,
-    "EXITED":       BoardState.EXITED,
+    "CONNECTED":     BoardState.CONNECTED,
+    "EASY":          BoardState.EASY,
+    "HARD":          BoardState.HARD,
+    "IDLE":          BoardState.IDLE,
+    "READY":         BoardState.CONNECTED,
+    "ALREADY IDLE":  BoardState.CONNECTED,
+    "ALREADY READY": BoardState.CONNECTED,
+    "EXITED":        BoardState.EXITED,
 }
 
 
