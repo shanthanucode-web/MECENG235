@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTextEdit,
     QVBoxLayout,
@@ -80,6 +81,16 @@ RESPONSE_TO_STATE: dict[str, BoardState] = {
     "EXITED":        BoardState.EXITED,
 }
 
+ACTIVITY_MESSAGES: dict[BoardState, tuple[str, str]] = {
+    BoardState.CONNECTED: ("TRAINER ONLINE · LED active",     "#00BCD4"),
+    BoardState.EASY:      ("EASY MODE · 500 ms blink",        "#FF8F00"),
+    BoardState.HARD:      ("HARD MODE · 100 ms blink",        "#D32F2F"),
+    BoardState.IDLE:      ("STANDBY · mode stopped",          "#3D4455"),
+    BoardState.EXITED:    ("SESSION ENDED · reset to resume", "#5C1010"),
+}
+
+MAX_FEED_CARDS = 20
+
 
 # ---------------------------------------------------------------------------
 # Vitals-style indicator widget
@@ -96,7 +107,6 @@ class LedIndicator(QWidget):
         self._state = BoardState.IDLE
         self._glow  = 1.0
 
-        # Beat animations: fast rise → decay → pause (heartbeat feel)
         self._beat_rise = QPropertyAnimation(self, b"glow_level")
         self._beat_rise.setEasingCurve(QEasingCurve.Type.OutQuad)
         self._beat_rise.setStartValue(0.05)
@@ -128,13 +138,11 @@ class LedIndicator(QWidget):
         self._state = state
         self._anim_group.stop()
         if state == BoardState.EASY:
-            # Slow heartbeat ~60 bpm
             self._beat_rise.setDuration(150)
             self._beat_fall.setDuration(250)
             self._beat_pause.setDuration(600)
             self._anim_group.start()
         elif state == BoardState.HARD:
-            # Urgent rhythm ~140 bpm
             self._beat_rise.setDuration(80)
             self._beat_fall.setDuration(150)
             self._beat_pause.setDuration(200)
@@ -150,7 +158,6 @@ class LedIndicator(QWidget):
         color = QColor(STATE_COLORS[self._state])
         cx, cy, r = self.SIZE / 2, self.SIZE / 2, self.SIZE / 2 - 3
 
-        # Outer glow ring (pulsing states)
         if self._state in (BoardState.EASY, BoardState.HARD):
             halo = QRadialGradient(cx, cy, r * 2.0)
             glow_color = QColor(color)
@@ -162,7 +169,6 @@ class LedIndicator(QWidget):
             painter.drawEllipse(int(cx - r * 2.0), int(cy - r * 2.0),
                                 int(r * 4.0), int(r * 4.0))
 
-        # Border ring
         ring_color = QColor(color)
         ring_color.setAlphaF(0.55)
         painter.setPen(QPen(ring_color, 1.5))
@@ -170,7 +176,6 @@ class LedIndicator(QWidget):
         painter.drawEllipse(int(cx - r - 2), int(cy - r - 2),
                             int((r + 2) * 2), int((r + 2) * 2))
 
-        # Main filled circle
         painter.setPen(QPen(color.darker(160), 1))
         fill_color = QColor(color)
         if self._state in (BoardState.EASY, BoardState.HARD):
@@ -178,7 +183,6 @@ class LedIndicator(QWidget):
         painter.setBrush(fill_color)
         painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
 
-        # Specular highlight
         painter.setBrush(QColor(255, 255, 255, 60))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(int(cx - r * 0.40), int(cy - r * 0.50),
@@ -187,7 +191,7 @@ class LedIndicator(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Serial worker thread  (logic unchanged)
+# Serial worker thread  (unchanged)
 # ---------------------------------------------------------------------------
 
 class SerialWorker(QThread):
@@ -211,14 +215,11 @@ class SerialWorker(QThread):
         self._running = True
         try:
             while self._running:
-                # Drain outgoing commands first
                 while not self._cmd_queue.empty():
                     try:
                         ser.write(self._cmd_queue.get_nowait())
                     except queue.Empty:
                         break
-
-                # Read one line (returns b'' on timeout)
                 raw = ser.readline()
                 if raw:
                     line = raw.decode(errors="replace").strip()
@@ -234,7 +235,7 @@ class SerialWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Separator helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _hline() -> QFrame:
@@ -251,7 +252,7 @@ def _section_label(text: str) -> QLabel:
 
 
 # ---------------------------------------------------------------------------
-# Stylesheet — surgical dark instrument panel
+# Stylesheet
 # ---------------------------------------------------------------------------
 
 STYLESHEET = """
@@ -262,6 +263,15 @@ QMainWindow, QWidget#central {
 QWidget#sensor_panel {
     background-color: #0B1220;
     border: 1px solid #1A2E48;
+}
+
+QScrollArea#feed_scroll {
+    background-color: #080C14;
+    border: 1px solid #0E1E2C;
+}
+
+QWidget#feed_container {
+    background-color: #080C14;
 }
 
 QLabel {
@@ -333,10 +343,7 @@ QComboBox QAbstractItemView {
     selection-background-color: #14385C;
     border: 1px solid #1A3450;
 }
-QComboBox::drop-down {
-    border: none;
-    width: 20px;
-}
+QComboBox::drop-down { border: none; width: 20px; }
 
 QPushButton {
     background-color: #0B1828;
@@ -351,9 +358,7 @@ QPushButton:hover {
     border-color: #2A6080;
     color: #A0C8E0;
 }
-QPushButton:pressed {
-    background-color: #060C18;
-}
+QPushButton:pressed { background-color: #060C18; }
 QPushButton:disabled {
     color: #162030;
     border-color: #0E1C2C;
@@ -396,9 +401,7 @@ QPushButton#btn_cmd:hover {
     border-color: #00BCD4;
     color: #00E5FF;
 }
-QPushButton#btn_cmd:pressed {
-    background-color: #060E1A;
-}
+QPushButton#btn_cmd:pressed { background-color: #060E1A; }
 
 QPushButton#btn_exit {
     background-color: #180808;
@@ -416,14 +419,30 @@ QPushButton#btn_exit:hover {
     border-color: #C62828;
     color: #EF5350;
 }
-QPushButton#btn_exit:pressed {
-    background-color: #0E0404;
+QPushButton#btn_exit:pressed { background-color: #0E0404; }
+
+QPushButton#btn_terminal {
+    background-color: #080C14;
+    color: #1E4A62;
+    border: none;
+    border-top: 1px solid #0E1E2C;
+    border-radius: 0px;
+    padding: 7px;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    text-align: center;
+}
+QPushButton#btn_terminal:hover {
+    background-color: #0B1220;
+    color: #2E6A8A;
 }
 
 QTextEdit#log {
     background-color: #040810;
     color: #4A7890;
-    border: 1px solid #0E1E30;
+    border: none;
+    border-top: 1px solid #0E1E30;
     border-radius: 0px;
     padding: 8px;
     font-family: "Courier New", "Menlo", monospace;
@@ -432,18 +451,16 @@ QTextEdit#log {
 
 QScrollBar:vertical {
     background: #060A12;
-    width: 6px;
+    width: 5px;
     border: none;
     margin: 0px;
 }
 QScrollBar::handle:vertical {
     background: #1A3450;
-    border-radius: 3px;
+    border-radius: 2px;
     min-height: 16px;
 }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0px;
-}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 """
 
 
@@ -459,14 +476,14 @@ class MainWindow(QMainWindow):
         self._connected = False
 
         self.setWindowTitle("Haptic Surgical Skill Trainer — Lab 4 Dev Interface")
-        self.setMinimumSize(QSize(580, 720))
+        self.setMinimumSize(QSize(580, 680))
 
         central = QWidget()
         central.setObjectName("central")
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setContentsMargins(24, 18, 24, 18)
+        root.setContentsMargins(24, 18, 24, 0)
         root.setSpacing(0)
 
         self._build_header(root)
@@ -478,18 +495,19 @@ class MainWindow(QMainWindow):
         root.addSpacing(14)
         self._build_state_panel(root)
         root.addSpacing(12)
+        self._build_activity_feed(root)
+        root.addSpacing(12)
         self._build_sensor_data(root)
         root.addSpacing(14)
         root.addWidget(_hline())
         root.addSpacing(14)
         self._build_command_buttons(root)
         root.addSpacing(14)
-        root.addWidget(_hline())
-        root.addSpacing(10)
-        self._build_log(root)
+        self._build_terminal(root)
 
         self._populate_ports()
         self._set_commands_enabled(False)
+        self._add_activity("INTERFACE INITIALIZED · CONNECT DEVICE", "#1E5E7A")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -511,8 +529,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(10)
 
-        port_lbl = QLabel("Port:")
-        row.addWidget(port_lbl)
+        row.addWidget(QLabel("Port:"))
 
         self._port_combo = QComboBox()
         row.addWidget(self._port_combo)
@@ -563,8 +580,81 @@ class MainWindow(QMainWindow):
 
         root.addLayout(row)
 
+    def _build_activity_feed(self, root: QVBoxLayout) -> None:
+        root.addWidget(_section_label("RECENT ACTIVITY"))
+        root.addSpacing(6)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("feed_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFixedHeight(172)
+
+        feed_container = QWidget()
+        feed_container.setObjectName("feed_container")
+
+        self._feed_layout = QVBoxLayout(feed_container)
+        self._feed_layout.setContentsMargins(0, 0, 0, 0)
+        self._feed_layout.setSpacing(0)
+        self._feed_layout.addStretch()
+
+        scroll.setWidget(feed_container)
+        root.addWidget(scroll)
+
+    def _make_activity_card(self, message: str, timestamp: str, color: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("activity_card")
+        card.setFixedHeight(38)
+        card.setStyleSheet(f"""
+            QFrame#activity_card {{
+                background-color: #0B1220;
+                border-left: 3px solid {color};
+                border-bottom: 1px solid #0A1828;
+                border-top: none;
+                border-right: none;
+            }}
+        """)
+
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(12, 0, 14, 0)
+        layout.setSpacing(10)
+
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {color}; font-size: 9px; border: none; background: transparent;")
+        dot.setFixedWidth(14)
+
+        msg_lbl = QLabel(message)
+        msg_lbl.setStyleSheet(
+            "color: #7AAFC8; font-size: 11px; font-weight: bold;"
+            " letter-spacing: 0.5px; border: none; background: transparent;"
+        )
+
+        ts_lbl = QLabel(timestamp)
+        ts_lbl.setStyleSheet(
+            "color: #1E4A62; font-size: 10px;"
+            " font-family: 'Courier New', monospace; border: none; background: transparent;"
+        )
+        ts_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        layout.addWidget(dot)
+        layout.addWidget(msg_lbl)
+        layout.addStretch()
+        layout.addWidget(ts_lbl)
+
+        return card
+
+    def _add_activity(self, message: str, color: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        card = self._make_activity_card(message, ts, color)
+        self._feed_layout.insertWidget(0, card)
+        # Trim oldest entries beyond limit
+        while self._feed_layout.count() > MAX_FEED_CARDS + 1:
+            item = self._feed_layout.takeAt(self._feed_layout.count() - 2)
+            if item and item.widget():
+                item.widget().deleteLater()
+
     def _build_sensor_data(self, root: QVBoxLayout) -> None:
-        """Placeholder sensor data panel — not yet wired to live data."""
         panel = QWidget()
         panel.setObjectName("sensor_panel")
         panel.setFixedHeight(74)
@@ -574,9 +664,9 @@ class MainWindow(QMainWindow):
         inner.setSpacing(0)
 
         for metric, value, unit in [
-            ("FORCE L",  "--",  "N"),
-            ("FORCE R",  "--",  "N"),
-            ("TREMOR",   "--",  "mm/s"),
+            ("FORCE L", "--", "N"),
+            ("FORCE R", "--", "N"),
+            ("TREMOR",  "--", "mm/s"),
         ]:
             col = QVBoxLayout()
             col.setSpacing(3)
@@ -600,15 +690,12 @@ class MainWindow(QMainWindow):
 
             val_row.addWidget(val_lbl)
             val_row.addWidget(unit_lbl)
-
             col.addWidget(key_lbl)
             col.addLayout(val_row)
             inner.addLayout(col)
             inner.addStretch()
 
-        # Remove trailing stretch
         inner.takeAt(inner.count() - 1)
-
         root.addWidget(panel)
 
     def _build_command_buttons(self, root: QVBoxLayout) -> None:
@@ -645,27 +732,52 @@ class MainWindow(QMainWindow):
 
         root.addLayout(row)
 
-    def _build_log(self, root: QVBoxLayout) -> None:
-        root.addWidget(_section_label("SERIAL MONITOR"))
-        root.addSpacing(6)
+    def _build_terminal(self, root: QVBoxLayout) -> None:
+        self._btn_terminal = QPushButton("▼   SHOW TERMINAL")
+        self._btn_terminal.setObjectName("btn_terminal")
+        self._btn_terminal.clicked.connect(self._toggle_terminal)
+        root.addWidget(self._btn_terminal)
+
+        self._terminal_container = QWidget()
+        term_layout = QVBoxLayout(self._terminal_container)
+        term_layout.setContentsMargins(0, 0, 0, 0)
+        term_layout.setSpacing(0)
 
         self._log_view = QTextEdit()
         self._log_view.setObjectName("log")
         self._log_view.setReadOnly(True)
+        self._log_view.setMinimumHeight(200)
         self._log_view.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        root.addWidget(self._log_view)
+        term_layout.addWidget(self._log_view)
+
+        self._terminal_container.setVisible(False)
+        root.addWidget(self._terminal_container)
+
+    @Slot()
+    def _toggle_terminal(self) -> None:
+        visible = not self._terminal_container.isVisible()
+        self._terminal_container.setVisible(visible)
+        if visible:
+            self._btn_terminal.setText("▲   HIDE TERMINAL")
+            self.setMinimumHeight(900)
+            if self.height() < 900:
+                self.resize(self.width(), 900)
+            sb = self._log_view.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        else:
+            self._btn_terminal.setText("▼   SHOW TERMINAL")
+            self.setMinimumHeight(680)
 
     # ------------------------------------------------------------------
-    # Port management  (logic unchanged)
+    # Port management  (unchanged)
     # ------------------------------------------------------------------
 
     @Slot()
     def _populate_ports(self) -> None:
         self._port_combo.clear()
         ports = serial.tools.list_ports.comports()
-        # On macOS prefer cu.* over tty.*
         preferred = [p for p in ports if "cu." in p.device]
         others    = [p for p in ports if "cu." not in p.device]
         for p in preferred + others:
@@ -677,7 +789,7 @@ class MainWindow(QMainWindow):
             self._port_combo.addItem("No ports found", userData=None)
 
     # ------------------------------------------------------------------
-    # Connection  (logic unchanged)
+    # Connection  (unchanged logic, added _add_activity calls)
     # ------------------------------------------------------------------
 
     @Slot()
@@ -707,6 +819,7 @@ class MainWindow(QMainWindow):
         self._btn_connect.style().polish(self._btn_connect)
         self._set_commands_enabled(True)
         self._log(f"Opening {port} at 115200…", "sys")
+        self._add_activity(f"CONNECTED · {port.split('/')[-1]}", "#00BCD4")
 
     def _disconnect(self) -> None:
         if self._worker:
@@ -721,9 +834,10 @@ class MainWindow(QMainWindow):
         self._set_commands_enabled(False)
         self._update_state(BoardState.IDLE)
         self._log("Disconnected.", "sys")
+        self._add_activity("DISCONNECTED · session closed", "#3D4455")
 
     # ------------------------------------------------------------------
-    # Slots  (logic unchanged)
+    # Slots  (unchanged logic, added _add_activity calls)
     # ------------------------------------------------------------------
 
     @Slot(str)
@@ -732,22 +846,27 @@ class MainWindow(QMainWindow):
         state = RESPONSE_TO_STATE.get(line)
         if state is not None:
             self._update_state(state)
+            msg, color = ACTIVITY_MESSAGES[state]
+            self._add_activity(msg, color)
         elif line.startswith("READY:"):
             self._update_state(BoardState.IDLE)
+            self._add_activity("SYSTEM READY · awaiting commands", "#1E5E7A")
 
     @Slot(str)
     def _on_error(self, msg: str) -> None:
         self._log(f"Serial error: {msg}", "err")
+        self._add_activity(f"ERROR · {msg[:50]}", "#EF5350")
         self._disconnect()
 
     @Slot()
     def _on_worker_finished(self) -> None:
         if self._connected:
             self._log("Connection lost.", "err")
+            self._add_activity("CONNECTION LOST", "#EF5350")
             self._disconnect()
 
     # ------------------------------------------------------------------
-    # Commands  (logic unchanged)
+    # Commands  (unchanged)
     # ------------------------------------------------------------------
 
     def _send_command(self, cmd: str) -> None:
@@ -757,7 +876,7 @@ class MainWindow(QMainWindow):
         self._log(cmd, "tx")
 
     # ------------------------------------------------------------------
-    # State display
+    # State display  (unchanged)
     # ------------------------------------------------------------------
 
     def _update_state(self, state: BoardState) -> None:
@@ -779,7 +898,7 @@ class MainWindow(QMainWindow):
             btn.setEnabled(enabled)
 
     # ------------------------------------------------------------------
-    # Log
+    # Log  (unchanged)
     # ------------------------------------------------------------------
 
     def _log(self, text: str, direction: str) -> None:
@@ -797,7 +916,7 @@ class MainWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
     # ------------------------------------------------------------------
-    # Cleanup  (logic unchanged)
+    # Cleanup  (unchanged)
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
