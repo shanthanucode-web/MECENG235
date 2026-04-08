@@ -22,7 +22,7 @@
  * - I: force the LED on to confirm the UART link is working
  * - E: enter easy mode and blink slowly
  * - H: enter hard mode and blink quickly
- * - S: stop the active mode and return to idle
+ * - S: stop the active mode and return to a ready state
  * - X: exit the program until the board is reset or reflashed
  */
 
@@ -42,7 +42,7 @@
 
 typedef enum {
     BOARD_STATE_IDLE = 0,
-    BOARD_STATE_CONNECTED,
+    BOARD_STATE_READY,
     BOARD_STATE_EASY,
     BOARD_STATE_HARD,
     BOARD_STATE_EXITED,
@@ -76,11 +76,11 @@ static void blink_task(void *arg)
 
         switch (state) {
         case BOARD_STATE_IDLE:
-            set_led(true);
+            set_led(false);
             vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_PERIOD_MS));
             break;
 
-        case BOARD_STATE_CONNECTED:
+        case BOARD_STATE_READY:
             set_led(true);
             vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_PERIOD_MS));
             break;
@@ -124,7 +124,7 @@ static void echo_task(void *arg)
     ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
 
-    uart_send_line("READY: I E H S X");
+    uart_send_line("COMMANDS: I E H S X");
 
     while (1) {
         int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, BUF_SIZE - 1, pdMS_TO_TICKS(20));
@@ -137,7 +137,7 @@ static void echo_task(void *arg)
 
         switch (data[0]) {
         case 'I':
-            s_board_state = BOARD_STATE_CONNECTED;
+            s_board_state = BOARD_STATE_READY;
             set_led(true);
             uart_send_line("CONNECTED");
             break;
@@ -154,11 +154,11 @@ static void echo_task(void *arg)
 
         case 'S':
             if (s_board_state == BOARD_STATE_EASY || s_board_state == BOARD_STATE_HARD) {
-                s_board_state = BOARD_STATE_IDLE;
+                s_board_state = BOARD_STATE_READY;
                 set_led(true);
-                uart_send_line("IDLE");
+                uart_send_line("READY");
             } else {
-                uart_send_line("ALREADY IDLE");
+                uart_send_line("ALREADY READY");
             }
             break;
 
@@ -181,6 +181,6 @@ void app_main(void)
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
     set_led(false);
 
-    xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
-    xTaskCreate(blink_task, "blink_led_task", 2048, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL, 0);
+    xTaskCreatePinnedToCore(blink_task, "blink_led_task", 2048, NULL, 5, NULL, 1);
 }
