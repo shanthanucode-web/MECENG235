@@ -3,16 +3,17 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.port": "/dev/tty.usbserial-59691016461",
-  "idf.currentSetup": "/Users/shanthanu/.espressif/v6.0/esp-idf",
+  "idf.portWin": "COM4",
+  "idf.currentSetup": "C:\\esp\\v6.0\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
-  "clangd.path": "/Users/shanthanu/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/Users/shanthanu/uart_echo_VitalSignsLab4/build"
+    "--compile-commands-dir=c:\\Users\\Candice\\OneDrive\\Desktop\\uart_echo\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.monitorPort": "COM4"
 }
