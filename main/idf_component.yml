@@ -1,0 +1,3 @@
+## IDF Component Manager manifest
+## No managed dependencies required — all components are vendored in components/
+dependencies: {}

@@ -1,3 +1,21 @@
-idf_component_register(SRCS "uart_echo_example_main.c"
-                    REQUIRES esp_driver_uart esp_driver_gpio
-                    INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS
+        "main.c"
+        "acquisition.c"
+        "processing.c"
+        "calibration.c"
+        "filters.c"
+        "motor_control.c"
+        "nvs_storage.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_driver_uart
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_adc
+        nvs_flash
+        esp_timer
+        freertos
+        sh2
+        log
+)
