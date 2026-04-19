@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an ESP32 lab project (Haptic Surgical Skill Trainer — Lab 4) with two parts:
-1. **ESP-IDF firmware** (`main/`) — C code running on the ESP32 HUZZAH32
+This is an ESP32 lab project (Haptic Surgical Skill Trainer — Lab 4) with three parts:
+1. **ESP-IDF firmware** (`main/`, `components/`) — C code running on the ESP32 HUZZAH32
 2. **Python desktop GUI** (`gui/`) — PySide6 app running on the host computer
+3. **FSR diagnostic tool** (`tests/fsr_test.py`) — standalone terminal display for force sensor testing
 
 ---
 
@@ -15,30 +16,124 @@ This is an ESP32 lab project (Haptic Surgical Skill Trainer — Lab 4) with two 
 ### Build and Flash
 
 ```bash
-# Source ESP-IDF first (path depends on local install)
-source ~/.espressif/v6.0/esp-idf/export.sh
-
-# Build, flash, and open monitor
-idf.py -p /dev/cu.usbserial-59691016461 flash monitor
+# Activate ESP-IDF environment
+source ~/.espressif/tools/activate_idf_v6.0.sh
 
 # Build only
-idf.py build
+python3 ~/.espressif/v6.0/esp-idf/tools/idf.py build
 
-# Open menuconfig (UART port, baud rate, task stack size)
-idf.py menuconfig
+# Flash and open monitor
+python3 ~/.espressif/v6.0/esp-idf/tools/idf.py -p /dev/cu.usbserial-59691016461 flash monitor
 ```
 
 Exit the monitor with `Ctrl-]`.
 
-### Key Configuration (sdkconfig / Kconfig)
+Note: `idf.py` is not on PATH by default. Always invoke via `python3 ~/.espressif/v6.0/esp-idf/tools/idf.py`.
 
-Active values from `sdkconfig`:
-- `CONFIG_EXAMPLE_UART_PORT_NUM=0` — UART0 (same as console)
-- `CONFIG_EXAMPLE_UART_TXD=1`, `CONFIG_EXAMPLE_UART_RXD=3`
-- `CONFIG_EXAMPLE_UART_BAUD_RATE=115200`
-- `CONFIG_EXAMPLE_TASK_STACK_SIZE=3072`
+### File Structure
 
-Change these via `idf.py menuconfig`, not by editing `sdkconfig` directly. `sdkconfig` is gitignored.
+```
+main/
+  main.c               — app_main: queue creation, hardware init, task pinning
+  data_types.h         — shared structs (raw_sample_t, cal_params_t) and all #defines
+  acquisition.c/.h     — Core 0: 100 Hz timer, ADC (FSR × 3), BNO085, queue post
+  processing.c/.h      — Core 1: IIR filters, state machine, thresholds, JSON, commands
+  calibration.c/.h     — calibration sub-state machine (C1–C4, NVS save)
+  filters.c/.h         — Butterworth biquad IIR: LP 12 Hz, BP 6–12 Hz, LP 10 Hz
+  motor_control.c/.h   — vibration motor GPIO pulse (MOTORS_ENABLED=0 by default)
+  nvs_storage.c/.h     — NVS load/save for cal_params_t
+
+components/
+  sh2/                 — vendored CEVA BNO085 sh2 driver + ESP-IDF I2C HAL
+```
+
+---
+
+## Firmware Architecture
+
+### Dual-Core Task Assignment
+
+The firmware uses `xTaskCreatePinnedToCore` to pin each task to a dedicated CPU core.
+This is confirmed at boot: `I (200) cpu_start: Multicore app`.
+
+| Task | Core | Stack | Priority | Role |
+|------|------|-------|----------|------|
+| `acq_task` | 0 (PRO) | 4096 B | 10 | ADC + IMU sampling at 100 Hz |
+| `proc_task` | 1 (APP) | 8192 B | 9  | Filtering, state machine, JSON output |
+
+### Inter-Core Communication
+
+The only data path between cores is a **FreeRTOS queue** (`QueueHandle_t raw_q`, depth 10).
+
+- Core 0 calls `xQueueSend(&samp, 0)` — non-blocking, drops oldest if full
+- Core 1 calls `xQueueReceive(&samp, portMAX_DELAY)` — blocks until data arrives
+- The queue copies `raw_sample_t` by value (no shared pointers, no mutex needed)
+
+### State Machine
+
+`IDLE → HOLD` (any finger contact + omega < 10 deg/s for 150 ms)
+`IDLE → ACTIVE` (any finger contact + omega ≥ 10 deg/s)
+Any state → `EXITED` (via X command)
+
+### UART Protocol
+
+UART0, 115200 baud, GPIO 1=TX, GPIO 3=RX.
+
+**Commands (host → ESP32):** `I` (identify), `E` (easy), `M` (medium), `H` (hard),
+`S` (stop), `C1`–`C4` (calibration steps), `X` (exit), `Z` (erase NVS)
+
+**Telemetry (ESP32 → host):** JSON at 20 Hz (every 5th sample of 100 Hz acquisition).
+All output via `uart_write_bytes()` directly — ESP_LOG is silenced after the startup
+banner to prevent log messages from fragmenting JSON lines.
+
+Example JSON:
+```json
+{"t":12340,"f0":0.196,"f1":0.0,"f2":0.0,"ax":0.01,"ay":-0.02,"az":1.0,
+ "gx":0.1,"gy":-0.2,"gz":0.0,"roll":1.2,"pitch":-0.5,"yaw":45.0,
+ "f_sum":0.196,"tremor":0.02,"f95":1.6,"pp_roll":0.5,"pp_pitch":0.3,
+ "cv_f":0.04,"swing":0.0,"contact":[1,0,0],"state":"HOLD",
+ "warn":0,"err":0,"score":100.0,"actual_hz":100.00}
+```
+
+### IMU-Absent Mode
+
+If the BNO085 is not connected, `bno085_init()` probes the I2C address with
+`i2c_master_probe()` (50 ms timeout) before calling `sh2_open()`. On failure it sets
+`s_imu_ok = false` and continues — FSR sampling runs normally, IMU fields are zero.
+
+### Force Thresholds (Horeman et al. 2010)
+
+- Per-finger warning: > 0.8 N | Per-finger error: > 1.5 N
+- F_sum warning: > 2.0 N sustained 100 ms | F_sum error: > 4.0 N sustained 100 ms
+- F_ref_open default: 0.9 N (expert mean)
+- Mode multipliers (E/M/H commands) scale warn/err relative to `f_ref_open`
+
+### Key GPIO Assignments
+
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| FSR thumb | 34 | ADC1_CH6, input-only |
+| FSR index | 39 | ADC1_CH3, input-only |
+| FSR middle | 32 | ADC1_CH4 |
+| BNO085 SDA | 22 | I2C0 |
+| BNO085 SCL | 20 | I2C0 |
+| BNO085 INT | 15 | falling-edge ISR |
+| Freq proof | 33 | toggled each 100 Hz tick |
+| Core 1 debug | 12 | toggled each processing cycle |
+
+---
+
+## FSR Diagnostic Tool
+
+Standalone terminal display — does not require the GUI:
+
+```bash
+python tests/fsr_test.py              # auto-detect port
+python tests/fsr_test.py --list-ports # list all serial ports
+python tests/fsr_test.py --log        # also write CSV log
+```
+
+Only one process can hold the serial port at a time. Stop `idf.py monitor` before running.
 
 ---
 
@@ -52,25 +147,6 @@ python gui/esp32_controller.py
 ```
 
 Requires Python 3.10+ for `X | Y` union type hints.
-
----
-
-## Firmware Architecture
-
-**Single source file:** `main/uart_echo_example_main.c`
-
-Two FreeRTOS tasks pinned to separate cores:
-
-| Task | Core | Stack | Priority | Role |
-|------|------|-------|----------|------|
-| `echo_task` | 0 (PRO) | 3072 B | 10 | UART read loop, command dispatch |
-| `blink_task` | 1 (APP) | 2048 B | 5 | LED state machine, timing |
-
-State is shared via `volatile board_state_t s_board_state`. No mutex — single writer (`echo_task`), single reader (`blink_task`), and the enum transitions are atomic on this architecture.
-
-**State machine:** `IDLE → CONNECTED → EASY/HARD → IDLE` (via S), or any state `→ EXITED` (via X). `EXITED` is terminal until reset.
-
-**UART protocol:** single uppercase byte in, `\r\n`-terminated ASCII line out. Firmware sends `READY: I E H S X` on startup.
 
 ---
 
@@ -94,5 +170,6 @@ Three logical layers:
 
 ## Branches
 
-- `main` — stable firmware baseline
-- `pythonGUI` — current active branch with GUI + dual-core firmware
+- `main` — stable LED blink baseline (original demo)
+- `pythonGUI` — GUI + early dual-core firmware
+- `hardware-integration` — **current**: full sensor firmware (FSR + IMU + calibration + JSON)
