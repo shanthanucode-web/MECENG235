@@ -1,6 +1,6 @@
 #include "sh2_hal_esp32.h"
 
-#include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 
@@ -8,15 +8,17 @@
 
 static const char *TAG = "SH2_HAL";
 
-#define SH2_I2C_TIMEOUT_MS  50
+#define SH2_UART_NUM      UART_NUM_2
+#define SH2_UART_BAUD     115200
+#define SH2_UART_RX_GPIO  32
+#define SH2_UART_TX_GPIO  33
+#define SH2_RX_BUF_BYTES  4096
+#define SH2_TX_BUF_BYTES  1024
 
 typedef struct {
-    i2c_master_bus_handle_t bus;
-    i2c_master_dev_handle_t dev;
-    uint8_t                 addr;
+    bool open;
 } sh2_hal_ctx_t;
 
-/* Module-level context (only one BNO085 instance expected) */
 static sh2_hal_ctx_t s_ctx;
 
 /* ── HAL callbacks ──────────────────────────────────────────────────────── */
@@ -25,74 +27,64 @@ static int hal_open(sh2_Hal_t *self)
 {
     (void)self;
 
-    i2c_device_config_t cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = s_ctx.addr,
-        .scl_speed_hz    = 400000,
+    uart_config_t cfg = {
+        .baud_rate  = SH2_UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
 
-    esp_err_t ret = i2c_master_bus_add_device(s_ctx.bus, &cfg, &s_ctx.dev);
+    esp_err_t ret = uart_param_config(SH2_UART_NUM, &cfg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_master_bus_add_device failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "uart_param_config failed: %s", esp_err_to_name(ret));
         return -1;
     }
+
+    ret = uart_set_pin(SH2_UART_NUM,
+                       SH2_UART_TX_GPIO, SH2_UART_RX_GPIO,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uart_set_pin failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+
+    ret = uart_driver_install(SH2_UART_NUM,
+                              SH2_RX_BUF_BYTES, SH2_TX_BUF_BYTES,
+                              0, NULL, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(ret));
+        return -1;
+    }
+
+    s_ctx.open = true;
     return 0;
 }
 
 static void hal_close(sh2_Hal_t *self)
 {
     (void)self;
-    i2c_master_bus_rm_device(s_ctx.dev);
-    s_ctx.dev = NULL;
+    if (s_ctx.open) {
+        uart_driver_delete(SH2_UART_NUM);
+        s_ctx.open = false;
+    }
 }
 
-/*
- * Read from the BNO085.
- *
- * The SHTP protocol begins every transfer with a 4-byte header whose first two
- * bytes contain the cargo length (little-endian, MSB continuation bit masked).
- * We perform a two-phase read:
- *   Phase 1: read exactly 4 bytes to get the header.
- *   Phase 2: if cargo length > 4, read the remaining bytes.
- *
- * Returns the total number of bytes placed in pBuffer, or 0 if no data ready.
- */
 static int hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len, uint32_t *t_us)
 {
     (void)self;
     *t_us = (uint32_t)esp_timer_get_time();
-
-    if (len < 4) {
-        return 0;
-    }
-
-    /* Read the 4-byte SHTP header first */
-    esp_err_t ret = i2c_master_receive(s_ctx.dev, pBuffer, 4, SH2_I2C_TIMEOUT_MS);
-    if (ret != ESP_OK) {
-        return 0;
-    }
-
-    /* Decode cargo length from header bytes 0–1 (mask continuation bit) */
-    unsigned cargo_len = ((unsigned)pBuffer[0] | ((unsigned)(pBuffer[1] & 0x7F) << 8));
-    if (cargo_len == 0 || cargo_len > len) {
-        return (cargo_len == 0) ? 0 : 4;
-    }
-
-    if (cargo_len > 4) {
-        /* Read the rest of the transfer */
-        ret = i2c_master_receive(s_ctx.dev, pBuffer + 4, cargo_len - 4, SH2_I2C_TIMEOUT_MS);
-        if (ret != ESP_OK) {
-            return 4;
-        }
-    }
-    return (int)cargo_len;
+    int n = uart_read_bytes(SH2_UART_NUM, pBuffer, (uint32_t)len,
+                            pdMS_TO_TICKS(50));
+    return (n > 0) ? n : 0;
 }
 
 static int hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
 {
     (void)self;
-    esp_err_t ret = i2c_master_transmit(s_ctx.dev, pBuffer, (size_t)len, SH2_I2C_TIMEOUT_MS);
-    return (ret == ESP_OK) ? (int)len : 0;
+    int n = uart_write_bytes(SH2_UART_NUM, pBuffer, (size_t)len);
+    return (n > 0) ? n : 0;
 }
 
 static uint32_t hal_getTimeUs(sh2_Hal_t *self)
@@ -103,13 +95,9 @@ static uint32_t hal_getTimeUs(sh2_Hal_t *self)
 
 /* ── Public initializer ─────────────────────────────────────────────────── */
 
-void sh2_hal_esp32_init(sh2_Hal_t *hal,
-                        i2c_master_bus_handle_t bus,
-                        uint8_t i2c_addr)
+void sh2_hal_esp32_init(sh2_Hal_t *hal)
 {
-    s_ctx.bus  = bus;
-    s_ctx.addr = i2c_addr;
-    s_ctx.dev  = NULL;
+    memset(&s_ctx, 0, sizeof(s_ctx));
 
     hal->open      = hal_open;
     hal->close     = hal_close;

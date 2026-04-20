@@ -33,12 +33,10 @@
  * Initialize all Core 0 hardware.
  * Must be called from app_main (Core 0) before spawning acquisition_task.
  *
- *   - ADC1 oneshot (GPIO 34=CH6, GPIO 39=CH3, GPIO 32=CH4)
- *   - I2C master bus (SDA=GPIO22, SCL=GPIO20) — non-fatal if wiring absent
- *   - BNO085 via CEVA sh2 library — probed first; sets s_imu_ok=false if absent
- *   - BNO085 INT falling-edge GPIO ISR (GPIO 15) — only if IMU present
+ *   - ADC1 oneshot (GPIO 34=CH6, GPIO 39=CH3, GPIO 36=CH0)
+ *   - UART2 for BNO085 UART-RVC mode (RX=GPIO32, 115200 baud)
  *   - 100 Hz esp_timer (ESP_TIMER_TASK dispatch)
- *   - GPIO 33 (freq proof toggle) and GPIO 12 (Core 1 debug) as outputs
+ *   - GPIO_FREQ_PROOF and GPIO_DBG_CORE1 as outputs
  *
  * out_queue — the inter-core queue created by app_main; Core 0 writes to it,
  *             Core 1 reads from it.
@@ -51,7 +49,7 @@ esp_err_t acquisition_init(QueueHandle_t out_queue);
  * Each iteration:
  *   1. Block on s_timer_sem (released by 100 Hz timer callback)
  *   2. Read ADC channels for all 3 FSR sensors
- *   3. If IMU is present: service sh2, copy latest IMU data
+ *   3. If IMU is present: read UART2 UART-RVC packet, parse into sample
  *   4. Post raw_sample_t to inter-core queue (non-blocking; drops oldest if full)
  *   5. Every 100 samples: log actual measured acquisition rate
  */

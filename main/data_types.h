@@ -12,20 +12,19 @@
 /* ── GPIO pin assignments ──────────────────────────────────────────────── */
 #define GPIO_FSR0        GPIO_NUM_34   /* ADC1_CH6 — input-only */
 #define GPIO_FSR1        GPIO_NUM_39   /* ADC1_CH3 — input-only */
-#define GPIO_FSR2        GPIO_NUM_32   /* ADC1_CH4 */
-#define GPIO_SDA         GPIO_NUM_22
-#define GPIO_SCL         GPIO_NUM_20
-#define GPIO_BNO_INT     GPIO_NUM_15
+#define GPIO_FSR2        GPIO_NUM_36   /* ADC1_CH0 — moved from GPIO 32 */
+#define GPIO_IMU_RX      GPIO_NUM_32   /* UART2 RX — BNO085 UART-RVC output */
+#define GPIO_IMU_TX      GPIO_NUM_33   /* BNO085 SCL/UART input — unused in RVC */
 #define GPIO_MOTOR0      GPIO_NUM_25
 #define GPIO_MOTOR1      GPIO_NUM_26
 #define GPIO_MOTOR2      GPIO_NUM_27
 #define GPIO_MOTOR3      GPIO_NUM_14
-#define GPIO_FREQ_PROOF  GPIO_NUM_33  /* toggled every timer ISR for frequency verification */
+#define GPIO_FREQ_PROOF  GPIO_NUM_13  /* toggled every timer ISR for frequency verification */
 #define GPIO_DBG_CORE1   GPIO_NUM_12  /* toggled every Core 1 processing cycle */
 
-/* ── I2C / BNO085 ──────────────────────────────────────────────────────── */
-#define BNO085_I2C_ADDR   0x4A
-#define I2C_MASTER_FREQ   400000      /* Hz */
+/* ── IMU — BNO085 UART-RVC ────────────────────────────────────────────── */
+#define IMU_UART_NUM   UART_NUM_2
+#define IMU_UART_BAUD  115200   /* UART-RVC mode (P0=3.3V) */
 
 /* ── Inter-core data packet: produced on Core 0, consumed on Core 1 ─────── */
 /*

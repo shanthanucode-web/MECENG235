@@ -7,57 +7,55 @@
 #include "freertos/queue.h"
 
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 
-#include "sh2.h"
-#include "sh2_err.h"
-#include "sh2_SensorValue.h"
-#include "sh2_hal_esp32.h"
-
-#include <math.h>
+#include <stdarg.h>
 #include <string.h>
+#include <stdio.h>
 
-#define RAD_TO_DEG  57.2957795131f
-#define G_TO_MS2    9.80665f      /* used to convert m/s² → g */
+#define G_MS2_TO_G  9.81f
 
 static const char *TAG = "ACQ";
 
 /* ── Module state ──────────────────────────────────────────────────────── */
 static QueueHandle_t             s_out_q;
 static SemaphoreHandle_t         s_timer_sem;
-static SemaphoreHandle_t         s_imu_sem;
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cali;
 
-static i2c_master_bus_handle_t   s_i2c_bus;
-static sh2_Hal_t                 s_sh2_hal;
-
-/* Latest IMU data updated by sensor callback (acquisition task reads it) */
-static volatile struct {
-    float accel_g[3];
-    float gyro_dps[3];
-    float quat[4];    /* w, x, y, z */
-    float euler[3];   /* roll, pitch, yaw (deg) */
-    bool  fresh;
-} s_imu_data;
-
 /* GPIO toggle state for freq proof pin */
 static volatile int s_freq_state = 0;
 
-/* Set to false when BNO085 init fails; acquisition task skips all sh2 calls */
-static bool s_imu_ok = false;
+/*
+ * Diagnostic buffer — filled during acquisition_init() before the UART0 driver
+ * is installed, then flushed via uart_write_bytes() at the start of
+ * acquisition_task().
+ */
+static char s_diag_buf[512];
+static int  s_diag_len = 0;
+
+static void diag_append(const char *fmt, ...)
+{
+    int remaining = (int)sizeof(s_diag_buf) - s_diag_len;
+    if (remaining <= 1) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(s_diag_buf + s_diag_len, (size_t)remaining, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        s_diag_len += (n < remaining) ? n : (remaining - 1);
+    }
+}
 
 /* ── FSR 402 voltage → Newton lookup table ─────────────────────────────── */
-/*
- * Pull-down circuit: FSR from 3.3V to ADC pin, 10kΩ from ADC pin to GND.
- * Values derived from FSR 402 datasheet resistance vs force curve.
- */
 typedef struct { float v_mv; float f_n; } fsr_lut_entry_t;
 
 static const fsr_lut_entry_t FSR402_LUT[] = {
@@ -91,135 +89,74 @@ static float fsr402_mv_to_newton(float v_mv)
     return 0.0f;
 }
 
-/* ── Timer callback — fires at 100 Hz in esp_timer task context ─────────── */
-/* ESP_TIMER_TASK dispatch runs in a high-priority task (pri 22), not a real ISR.
- * Regular FreeRTOS calls are safe here. */
+/* ── Timer callback — fires at 100 Hz ───────────────────────────────────── */
 static void timer_isr_cb(void *arg)
 {
     (void)arg;
-    /* Toggle GPIO 33 for software frequency proof measurement */
     s_freq_state ^= 1;
     gpio_set_level(GPIO_FREQ_PROOF, s_freq_state);
-
-    /* Wake acquisition task */
     xSemaphoreGive(s_timer_sem);
 }
 
-/* ── BNO085 INT GPIO ISR — falling edge ─────────────────────────────────── */
-static void IRAM_ATTR bno085_int_isr(void *arg)
+/* ── UART-RVC 19-byte packet reader ─────────────────────────────────────── */
+/*
+ * Packet layout (BNO085 UART-RVC, P0=3.3V, 115200 baud):
+ *   [0]    0xAA  header byte 1
+ *   [1]    0xAA  header byte 2
+ *   [2]    index (ignored)
+ *   [3-4]  yaw   int16 LE, /100.0 = degrees
+ *   [5-6]  pitch int16 LE, /100.0 = degrees
+ *   [7-8]  roll  int16 LE, /100.0 = degrees
+ *   [9-10] ax    int16 LE, /100.0 = m/s²
+ *  [11-12] ay    int16 LE, /100.0 = m/s²
+ *  [13-14] az    int16 LE, /100.0 = m/s²
+ *  [15-18] reserved
+ */
+static bool rvc_read_packet(float *yaw, float *pitch, float *roll,
+                            float *ax, float *ay, float *az)
 {
-    (void)arg;
-    BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR(s_imu_sem, &woken);
-    portYIELD_FROM_ISR(woken);
+    /* Search for 0xAA 0xAA header — non-blocking, drain up to 64 bytes */
+    for (int i = 0; i < 64; i++) {
+        uint8_t b0;
+        if (uart_read_bytes(IMU_UART_NUM, &b0, 1, 0) != 1) return false;
+        if (b0 != 0xAA) continue;
+        uint8_t b1;
+        if (uart_read_bytes(IMU_UART_NUM, &b1, 1, 0) != 1) return false;
+        if (b1 == 0xAA) goto header_found;
+        /* b1 wasn't 0xAA; start over treating b1 as a potential first byte */
+        if (b1 == 0xAA) break; /* unreachable — silences compiler */
+    }
+    return false;
+
+header_found:;
+    /* Read remaining 17 bytes: index + 6×int16 + 4 reserved */
+    uint8_t pkt[17];
+    int n = uart_read_bytes(IMU_UART_NUM, pkt, sizeof(pkt), pdMS_TO_TICKS(5));
+    if (n < (int)sizeof(pkt)) return false;
+
+    /* pkt[0] = index (ignored) */
+    int16_t raw_yaw   = (int16_t)((uint16_t)pkt[1]  | ((uint16_t)pkt[2]  << 8));
+    int16_t raw_pitch = (int16_t)((uint16_t)pkt[3]  | ((uint16_t)pkt[4]  << 8));
+    int16_t raw_roll  = (int16_t)((uint16_t)pkt[5]  | ((uint16_t)pkt[6]  << 8));
+    int16_t raw_ax    = (int16_t)((uint16_t)pkt[7]  | ((uint16_t)pkt[8]  << 8));
+    int16_t raw_ay    = (int16_t)((uint16_t)pkt[9]  | ((uint16_t)pkt[10] << 8));
+    int16_t raw_az    = (int16_t)((uint16_t)pkt[11] | ((uint16_t)pkt[12] << 8));
+
+    *yaw   = raw_yaw   / 100.0f;
+    *pitch = raw_pitch / 100.0f;
+    *roll  = raw_roll  / 100.0f;
+    *ax    = raw_ax    / 100.0f;
+    *ay    = raw_ay    / 100.0f;
+    *az    = raw_az    / 100.0f;
+
+    return true;
 }
 
-/* ── BNO085 sensor data callback ────────────────────────────────────────── */
-static void sh2_sensor_cb(void *cookie, sh2_SensorEvent_t *event)
-{
-    (void)cookie;
-
-    sh2_SensorValue_t val;
-    if (sh2_decodeSensorEvent(&val, event) != SH2_OK) {
-        return;
-    }
-
-    switch (val.sensorId) {
-    case SH2_LINEAR_ACCELERATION:
-        s_imu_data.accel_g[0] = val.un.linearAcceleration.x / G_TO_MS2;
-        s_imu_data.accel_g[1] = val.un.linearAcceleration.y / G_TO_MS2;
-        s_imu_data.accel_g[2] = val.un.linearAcceleration.z / G_TO_MS2;
-        break;
-
-    case SH2_GYROSCOPE_CALIBRATED:
-        /* sh2 gyro output is rad/s → convert to deg/s */
-        s_imu_data.gyro_dps[0] = val.un.gyroscope.x * RAD_TO_DEG;
-        s_imu_data.gyro_dps[1] = val.un.gyroscope.y * RAD_TO_DEG;
-        s_imu_data.gyro_dps[2] = val.un.gyroscope.z * RAD_TO_DEG;
-        break;
-
-    case SH2_GAME_ROTATION_VECTOR: {
-        /* sh2 quaternion: i, j, k, real  →  store as w, x, y, z */
-        float w = val.un.gameRotationVector.real;
-        float x = val.un.gameRotationVector.i;
-        float y = val.un.gameRotationVector.j;
-        float z = val.un.gameRotationVector.k;
-        s_imu_data.quat[0] = w;
-        s_imu_data.quat[1] = x;
-        s_imu_data.quat[2] = y;
-        s_imu_data.quat[3] = z;
-
-        /* Derive Euler angles (ZYX / aerospace convention) */
-        float sinr_cosp = 2.0f * (w * x + y * z);
-        float cosr_cosp = 1.0f - 2.0f * (x * x + y * y);
-        s_imu_data.euler[0] = atan2f(sinr_cosp, cosr_cosp) * RAD_TO_DEG; /* roll */
-
-        float sinp = 2.0f * (w * y - z * x);
-        if (fabsf(sinp) >= 1.0f) {
-            s_imu_data.euler[1] = copysignf(90.0f, sinp);
-        } else {
-            s_imu_data.euler[1] = asinf(sinp) * RAD_TO_DEG; /* pitch */
-        }
-
-        float siny_cosp = 2.0f * (w * z + x * y);
-        float cosy_cosp = 1.0f - 2.0f * (y * y + z * z);
-        s_imu_data.euler[2] = atan2f(siny_cosp, cosy_cosp) * RAD_TO_DEG; /* yaw */
-
-        s_imu_data.fresh = true;
-        break;
-    }
-
-    default:
-        break;
-    }
-}
-
-/* ── BNO085 initialization helper ───────────────────────────────────────── */
-static esp_err_t bno085_init(void)
-{
-    /* Probe the I2C address first (50 ms timeout).
-     * sh2_open() loops internally waiting for SHTP advertisement — it never
-     * returns when the sensor is absent.  The probe exits in ≤50 ms on failure. */
-    esp_err_t probe = i2c_master_probe(s_i2c_bus, BNO085_I2C_ADDR, 50);
-    if (probe != ESP_OK) {
-        ESP_LOGE(TAG, "BNO085 not found at 0x%02X — check SDA/SCL wiring (%s)",
-                 BNO085_I2C_ADDR, esp_err_to_name(probe));
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    sh2_hal_esp32_init(&s_sh2_hal, s_i2c_bus, BNO085_I2C_ADDR);
-
-    int rc = sh2_open(&s_sh2_hal, NULL, NULL);
-    if (rc != SH2_OK) {
-        ESP_LOGE(TAG, "sh2_open failed: %d", rc);
-        return ESP_FAIL;
-    }
-
-    sh2_ProductIds_t pids;
-    rc = sh2_getProdIds(&pids);
-    if (rc == SH2_OK) {
-        ESP_LOGI(TAG, "BNO085 part %u sw %u.%u.%u",
-                 (unsigned)pids.entry[0].swPartNumber,
-                 (unsigned)pids.entry[0].swVersionMajor,
-                 (unsigned)pids.entry[0].swVersionMinor,
-                 (unsigned)pids.entry[0].swVersionPatch);
-    } else {
-        ESP_LOGW(TAG, "sh2_getProdIds failed (%d) — IMU may not respond", rc);
-    }
-
-    sh2_setSensorCallback(sh2_sensor_cb, NULL);
-
-    /* Enable sensor reports at 10 ms period (100 Hz) */
-    sh2_SensorConfig_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.reportInterval_us = 10000; /* 10 ms = 100 Hz */
-
-    sh2_setSensorConfig(SH2_GAME_ROTATION_VECTOR, &cfg);
-    sh2_setSensorConfig(SH2_GYROSCOPE_CALIBRATED, &cfg);
-    sh2_setSensorConfig(SH2_LINEAR_ACCELERATION,  &cfg);
-
-    return ESP_OK;
-}
+/* Gyro-from-Euler state (differentiator at 100 Hz) */
+static float s_prev_roll    = 0.0f;
+static float s_prev_pitch   = 0.0f;
+static float s_prev_yaw     = 0.0f;
+static bool  s_first_sample = true;
 
 /* ── ADC initialization ─────────────────────────────────────────────────── */
 static esp_err_t adc_init(void)
@@ -234,26 +171,22 @@ static esp_err_t adc_init(void)
         .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    /* GPIO 34 = ADC1_CH6 (FSR0), GPIO 39 = ADC1_CH3 (FSR1), GPIO 32 = ADC1_CH4 (FSR2) */
+    /* GPIO 34=ADC1_CH6(FSR0), GPIO 39=ADC1_CH3(FSR1), GPIO 36=ADC1_CH0(FSR2) */
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_6, &chan_cfg));
     ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_3, &chan_cfg));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_4, &chan_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &chan_cfg));
 
-    /* ADC calibration using line-fitting scheme */
     adc_cali_line_fitting_config_t cali_cfg = {
         .unit_id  = ADC_UNIT_1,
         .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-
-    /* Check if efuse has a valid reference voltage; supply default if not */
     adc_cali_line_fitting_efuse_val_t efuse_val;
     esp_err_t efuse_ret = adc_cali_scheme_line_fitting_check_efuse(&efuse_val);
     if (efuse_ret == ESP_OK &&
         efuse_val == ADC_CALI_LINE_FITTING_EFUSE_VAL_DEFAULT_VREF) {
         cali_cfg.default_vref = 1100;
     }
-
     ESP_ERROR_CHECK(adc_cali_create_scheme_line_fitting(&cali_cfg, &s_cali));
 
     return ESP_OK;
@@ -265,68 +198,50 @@ esp_err_t acquisition_init(QueueHandle_t out_queue)
 {
     s_out_q = out_queue;
 
-    /* Semaphores */
     s_timer_sem = xSemaphoreCreateBinary();
-    s_imu_sem   = xSemaphoreCreateBinary();
-    configASSERT(s_timer_sem && s_imu_sem);
+    configASSERT(s_timer_sem);
 
-    /* GPIO 33 — frequency proof toggle output */
     gpio_reset_pin(GPIO_FREQ_PROOF);
     gpio_set_direction(GPIO_FREQ_PROOF, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_FREQ_PROOF, 0);
 
-    /* GPIO 12 — Core 1 debug toggle (init here; driven by processing task) */
     gpio_reset_pin(GPIO_DBG_CORE1);
     gpio_set_direction(GPIO_DBG_CORE1, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_DBG_CORE1, 0);
 
-    /* ADC */
+    gpio_reset_pin(GPIO_IMU_TX);
+    gpio_set_direction(GPIO_IMU_TX, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_IMU_TX, GPIO_PULLUP_ONLY);
+
     ESP_ERROR_CHECK(adc_init());
 
-    /* I2C master bus — non-fatal so a bad SCL/SDA pin does not abort boot */
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port          = I2C_NUM_0,
-        .sda_io_num        = GPIO_SDA,
-        .scl_io_num        = GPIO_SCL,
-        .clk_source        = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+    /* IMU — BNO085 UART-RVC mode (P0=3.3V), 115200 baud, RX-only */
+    uart_config_t rvc_cfg = {
+        .baud_rate  = IMU_UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
-    esp_err_t i2c_ret = i2c_new_master_bus(&bus_cfg, &s_i2c_bus);
-    if (i2c_ret != ESP_OK) {
-        ESP_LOGE(TAG, "ACQ: I2C bus init FAILED (%s) — IMU disabled",
-                 esp_err_to_name(i2c_ret));
-        /* s_imu_ok stays false; skip all BNO085 setup */
-        goto start_timer;
-    }
+    ESP_ERROR_CHECK(uart_param_config(IMU_UART_NUM, &rvc_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(IMU_UART_NUM,
+                                 UART_PIN_NO_CHANGE, GPIO_IMU_RX,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(IMU_UART_NUM, 512, 0, 0, NULL, 0));
+    diag_append("IMU: BNO085 UART-RVC RX=GPIO%d %d baud\r\n",
+                (int)GPIO_IMU_RX, (int)IMU_UART_BAUD);
 
-    /* BNO085 — non-fatal: probe first, then open sh2 */
-    if (bno085_init() == ESP_OK) {
-        s_imu_ok = true;
-        /* Only register INT ISR when the sensor is confirmed present */
-        gpio_reset_pin(GPIO_BNO_INT);
-        gpio_set_direction(GPIO_BNO_INT, GPIO_MODE_INPUT);
-        gpio_set_pull_mode(GPIO_BNO_INT, GPIO_PULLUP_ONLY);
-        gpio_set_intr_type(GPIO_BNO_INT, GPIO_INTR_NEGEDGE);
-        ESP_ERROR_CHECK(gpio_install_isr_service(0));
-        ESP_ERROR_CHECK(gpio_isr_handler_add(GPIO_BNO_INT, bno085_int_isr, NULL));
-    } else {
-        ESP_LOGE(TAG, "ACQ: BNO085 init FAILED — FSR-only mode");
-    }
-
-start_timer:;
-
-    /* 100 Hz hardware timer */
     esp_timer_create_args_t timer_args = {
         .callback        = timer_isr_cb,
         .arg             = NULL,
-        .dispatch_method = ESP_TIMER_TASK, /* ISR dispatch requires CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD */
+        .dispatch_method = ESP_TIMER_TASK,
         .name            = "acq_timer",
         .skip_unhandled_events = true,
     };
     esp_timer_handle_t timer_h;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_h));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_h, 10000)); /* 10 000 µs = 100 Hz */
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_h, 10000));
 
     ESP_LOGI(TAG, "ACQ TASK: running on Core %d at 100 Hz", xPortGetCoreID());
     return ESP_OK;
@@ -334,14 +249,7 @@ start_timer:;
 
 /* ── Acquisition task (Core 0) ──────────────────────────────────────────── */
 /*
- * This task runs exclusively on Core 0 (PRO CPU).
- *
- * It is a tight producer loop: wake → sample → send → sleep.
- * All heavy work (filtering, thresholds, UART) happens on Core 1.
- *
- * The 100 Hz cadence is driven by s_timer_sem, not by vTaskDelay.
- * Using a semaphore rather than a delay means the task wakes at exactly
- * the moment the hardware timer fires, not after an OS tick rounding error.
+ * Producer loop: wake (100 Hz timer) → sample ADC → read RVC packet → queue.
  */
 void acquisition_task(void *arg)
 {
@@ -350,24 +258,20 @@ void acquisition_task(void *arg)
     static const adc_channel_t FSR_CHANNELS[3] = {
         ADC_CHANNEL_6, /* GPIO 34 — thumb  (ADC1_CH6) */
         ADC_CHANNEL_3, /* GPIO 39 — index  (ADC1_CH3) */
-        ADC_CHANNEL_4, /* GPIO 32 — middle (ADC1_CH4) */
+        ADC_CHANNEL_0, /* GPIO 36 — middle (ADC1_CH0) */
     };
 
-    int64_t  last_rate_t  = esp_timer_get_time();
-    int      rate_cnt     = 0;
+    /* Flush startup diagnostics via UART0 (driver now installed) */
+    if (s_diag_len > 0) {
+        uart_write_bytes(UART_NUM_0, s_diag_buf, (size_t)s_diag_len);
+    }
+
+    int64_t last_rate_t = esp_timer_get_time();
+    int     rate_cnt    = 0;
 
     for (;;) {
         /*
-         * STEP 1 — wait for the 100 Hz timer tick.
-         *
-         * The esp_timer fires every 10 000 µs on Core 0 (ESP_TIMER_TASK
-         * dispatch).  Its callback (timer_isr_cb) takes < 5 µs:
-         *   1. toggles GPIO 33 (frequency proof)
-         *   2. calls xSemaphoreGive(s_timer_sem)
-         *   3. returns
-         *
-         * This task then wakes from portMAX_DELAY and owns Core 0 for
-         * the rest of the 10 ms window.
+         * STEP 1 — wait for 100 Hz timer tick.
          */
         xSemaphoreTake(s_timer_sem, portMAX_DELAY);
 
@@ -376,13 +280,8 @@ void acquisition_task(void *arg)
         samp.timestamp_us = esp_timer_get_time();
 
         /*
-         * STEP 2 — sample ADC.
-         *
-         * adc_oneshot_read is synchronous and takes ~50 µs per channel.
-         * Three channels = ~150 µs total.  Well within the 10 ms window.
-         * Voltage is converted to Newtons via the FSR 402 LUT.
+         * STEP 2 — sample all 3 FSR channels via ADC.
          */
-        /* ── ADC: read all 3 FSR channels ─────────────────────────────── */
         for (int i = 0; i < 3; i++) {
             int raw = 0;
             int v_mv = 0;
@@ -392,47 +291,47 @@ void acquisition_task(void *arg)
         }
 
         /*
-         * STEP 3 — read IMU (if present).
+         * STEP 3 — read UART-RVC packet and derive gyro from Euler differences.
          *
-         * s_imu_ok is set once in acquisition_init() and never changes.
-         * When false (IMU not wired or probe failed), this entire block
-         * is skipped — no semaphore wait, no I2C, no sh2 call.
-         * IMU fields in samp remain zero from the memset above.
-         *
-         * When true: s_imu_sem is given by the BNO085 INT falling-edge ISR
-         * (bno085_int_isr on GPIO 15).  We take it non-blocking (timeout=0)
-         * so we never stall waiting for the IMU.  If the semaphore is not
-         * ready this tick, we reuse the previous sample's IMU values.
+         * euler_deg[0]=roll, [1]=pitch, [2]=yaw  (matches processing.c convention)
+         * gyro_dps is approximated by finite differences at dt=10 ms.
          */
-        /* ── IMU: service sh2 only if BNO085 initialised successfully ─────── */
-        if (s_imu_ok) {
-            if (xSemaphoreTake(s_imu_sem, 0) == pdTRUE) {
-                sh2_service(); /* pumps SHTP, fires sh2_sensor_cb callbacks */
+        float yaw, pitch, roll, ax_ms2, ay_ms2, az_ms2;
+        if (rvc_read_packet(&yaw, &pitch, &roll, &ax_ms2, &ay_ms2, &az_ms2)) {
+            samp.euler_deg[0] = roll;
+            samp.euler_deg[1] = pitch;
+            samp.euler_deg[2] = yaw;
+            samp.accel_g[0] = ax_ms2 / G_MS2_TO_G;
+            samp.accel_g[1] = ay_ms2 / G_MS2_TO_G;
+            samp.accel_g[2] = az_ms2 / G_MS2_TO_G;
+            memset(samp.quat, 0, sizeof(samp.quat));
+
+            if (!s_first_sample) {
+                float dt   = 0.01f;
+                float dyaw = yaw - s_prev_yaw;
+                if (dyaw >  180.0f) dyaw -= 360.0f;
+                if (dyaw < -180.0f) dyaw += 360.0f;
+                samp.gyro_dps[0] = (roll  - s_prev_roll)  / dt;
+                samp.gyro_dps[1] = (pitch - s_prev_pitch) / dt;
+                samp.gyro_dps[2] = dyaw / dt;
             }
-            memcpy(samp.accel_g,  (void *)s_imu_data.accel_g,  sizeof(samp.accel_g));
-            memcpy(samp.gyro_dps, (void *)s_imu_data.gyro_dps, sizeof(samp.gyro_dps));
-            memcpy(samp.quat,     (void *)s_imu_data.quat,      sizeof(samp.quat));
-            memcpy(samp.euler_deg,(void *)s_imu_data.euler,     sizeof(samp.euler_deg));
+            s_first_sample = false;
+            s_prev_roll    = roll;
+            s_prev_pitch   = pitch;
+            s_prev_yaw     = yaw;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
-        /* If s_imu_ok is false, IMU fields remain zero from memset above */
 
         /*
-         * STEP 4 — hand off to Core 1.
-         *
-         * xQueueSend copies samp by value into the queue's internal DRAM
-         * buffer (thread-safe across cores).  Timeout=0 means non-blocking:
-         * if Core 1 is behind, we drop the oldest sample rather than
-         * stalling Core 0.  Core 0 must never block on Core 1's pace.
+         * STEP 4 — hand off to Core 1 via the inter-core queue.
          */
-        /* ── Post to processing queue ──────────────────────────────────── */
         if (xQueueSend(s_out_q, &samp, 0) != pdTRUE) {
-            /* Queue full — Core 1 is behind; drop oldest to keep data fresh */
             raw_sample_t discard;
             xQueueReceive(s_out_q, &discard, 0);
             xQueueSend(s_out_q, &samp, 0);
         }
 
-        /* ── Actual rate measurement every 100 samples ─────────────────── */
         if (++rate_cnt >= 100) {
             int64_t now = esp_timer_get_time();
             float actual_hz = 100.0f / ((float)(now - last_rate_t) * 1e-6f);

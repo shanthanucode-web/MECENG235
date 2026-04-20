@@ -25,7 +25,7 @@ both cores so that sensor sampling is never interrupted by computation.
 │   │    → gives s_timer_sem              │                           │
 │   │  acquisition_task wakes             │                           │
 │   │    → reads ADC (3× FSR 402)         │                           │
-│   │    → reads BNO085 via I2C (if OK)   │                           │
+│   │    → reads BNO085 UART-RVC if data  │                           │
 │   │    → packs raw_sample_t             │                           │
 │   │    → xQueueSend ─────────────────────┼──────────────────┐       │
 │   └─────────────────────────────────────┘                  │       │
@@ -76,8 +76,10 @@ The only data path between cores is a **FreeRTOS queue** (`QueueHandle_t raw_q`)
 - FreeRTOS internally uses a mutex + critical section to make queue operations
   thread-safe across cores without any application-level locking
 
-`raw_sample_t` is the unit of transfer: 76 bytes containing timestamp, FSR forces (N),
-accelerometer (g), gyroscope (deg/s), quaternion, and Euler angles.
+`raw_sample_t` is the unit of transfer: 72 bytes containing timestamp, FSR forces (N),
+accelerometer (g), derived gyroscope (deg/s), quaternion placeholder, and Euler angles.
+In UART-RVC mode the BNO085 does not provide quaternion or gyro reports; quaternion is
+zeroed and gyro is approximated from Euler angle differences at 100 Hz.
 
 ---
 
@@ -88,7 +90,7 @@ uart_echo_VitalSignsLab4/
 ├── main/
 │   ├── main.c               # app_main: task creation, queue, UART driver
 │   ├── data_types.h         # shared structs (raw_sample_t, cal_params_t) + defines
-│   ├── acquisition.c/.h     # Core 0: timer ISR, ADC, BNO085, queue post
+│   ├── acquisition.c/.h     # Core 0: timer ISR, ADC, BNO085 UART-RVC, queue post
 │   ├── processing.c/.h      # Core 1: filters, state machine, JSON output, commands
 │   ├── calibration.c/.h     # calibration sub-state machine (C1–C4)
 │   ├── filters.c/.h         # Butterworth IIR biquad implementations
@@ -97,12 +99,14 @@ uart_echo_VitalSignsLab4/
 │   ├── CMakeLists.txt
 │   └── idf_component.yml
 ├── components/
-│   └── sh2/                 # CEVA BNO085 sh2 driver + ESP-IDF I2C HAL
+│   └── sh2/                 # vendored SH-2 driver, currently disabled
 ├── gui/
 │   ├── esp32_controller.py  # PySide6 desktop GUI
 │   └── requirements.txt
 ├── tests/
-│   └── fsr_test.py          # standalone FSR diagnostic display (no GUI needed)
+│   ├── fsr_test.py          # standalone FSR diagnostic display
+│   ├── imu_test.py          # standalone IMU diagnostic display
+│   └── dual_core_monitor.py # acquisition/processing timing monitor
 └── CMakeLists.txt
 ```
 
@@ -114,16 +118,30 @@ uart_echo_VitalSignsLab4/
 |---|---|---|
 | FSR 402 thumb | GPIO 34 | ADC1_CH6, input-only |
 | FSR 402 index | GPIO 39 | ADC1_CH3, input-only |
-| FSR 402 middle | GPIO 32 | ADC1_CH4 |
-| BNO085 SDA | GPIO 22 | I2C0 |
-| BNO085 SCL | GPIO 20 | I2C0 |
-| BNO085 INT | GPIO 15 | falling-edge ISR |
+| FSR 402 middle | GPIO 36 | ADC1_CH0, input-only |
+| BNO085 SDA | GPIO 32 | UART2 RX, BNO085 data out to ESP32 |
+| BNO085 SCL | GPIO 33 | BNO085 UART input, unused in RVC; firmware leaves it input/pull-up |
+| BNO085 P0/PS0 | 3.3 V | High selects UART-RVC when BNO085 resets |
+| BNO085 P1/PS1 | Unconnected | Low by default for UART-RVC |
 | Motor 0 (force warn) | GPIO 25 | NPN driver, MOTORS_ENABLED=0 by default |
 | Motor 1 (force err) | GPIO 26 | NPN driver |
 | Motor 2 (instability) | GPIO 27 | NPN driver |
 | Motor 3 (tremor) | GPIO 14 | NPN driver |
-| Freq proof | GPIO 33 | toggled every 100 Hz tick for scope verification |
+| Freq proof | GPIO 13 | toggled every 100 Hz tick for scope verification |
 | Core 1 debug | GPIO 12 | toggled every processing cycle |
+
+### BNO085 UART-RVC wiring notes
+
+UART-RVC is output-only from the IMU for this project. The required connections are:
+
+- ESP32 3V → BNO085 VIN
+- ESP32 GND → BNO085 GND
+- ESP32 GPIO32 → BNO085 SDA
+- ESP32 3V → BNO085 P0/PS0
+- BNO085 P1/PS1 left unconnected
+
+The BNO085 samples P0/P1 at reset. After changing P0/P1 wiring, power-cycle the IMU;
+resetting only the ESP32 may leave the BNO085 in its previous mode.
 
 ---
 
@@ -178,7 +196,8 @@ All communication is over UART0 (115200 baud, GPIO 1=TX, 3=RX).
 ```
 
 JSON is output at 20 Hz (every 5th sample) to stay within 115200 baud capacity.
-The `actual_hz` field reports the true acquisition rate measured on Core 0.
+The `actual_hz` field is currently a nominal firmware value; use
+`tests/dual_core_monitor.py` or a scope on GPIO13 for timing verification.
 
 ---
 
@@ -199,7 +218,7 @@ Exit the monitor with `Ctrl-]`.
 
 ---
 
-## FSR Diagnostic Tool
+## Diagnostic Tools
 
 Test force sensors without the full GUI:
 
@@ -207,6 +226,19 @@ Test force sensors without the full GUI:
 python tests/fsr_test.py              # auto-detect port
 python tests/fsr_test.py --list-ports # show all serial ports
 python tests/fsr_test.py --log        # also write CSV log
+```
+
+Test the BNO085 UART-RVC stream:
+
+```bash
+python tests/imu_test.py              # auto-detect port
+python tests/imu_test.py --raw        # show raw JSON lines too
+```
+
+Monitor software timing:
+
+```bash
+python tests/dual_core_monitor.py --port /dev/cu.usbserial-XXXX
 ```
 
 ---
@@ -222,11 +254,17 @@ python gui/esp32_controller.py
 
 ## Troubleshooting
 
-### Board crash-loops on boot
-Check I2C wiring (SDA=GPIO22, SCL=GPIO20). If BNO085 is not connected, the firmware
-continues in FSR-only mode — IMU fields in JSON will be zero. The crash loop was
-caused by `sh2_open()` blocking indefinitely when the sensor is absent; the fix is an
-`i2c_master_probe()` call that times out in 50 ms before attempting `sh2_open()`.
+### IMU fields stay zero
+The firmware is in BNO085 UART-RVC mode, not I2C/SH-2 mode. Check:
+
+- BNO085 SDA is wired to ESP32 GPIO32.
+- BNO085 P0/PS0 is tied to 3.3 V.
+- BNO085 P1/PS1 is unconnected/low.
+- BNO085 and ESP32 share ground.
+- The BNO085 was power-cycled after P0/P1 wiring changed.
+
+RVC does not require ESP32 TX. If debugging, disconnect BNO085 SCL from GPIO33 and
+leave only SDA→GPIO32 plus power, ground, and P0 high.
 
 ### fsr_test.py connects to wrong port
 Run `python tests/fsr_test.py --list-ports` to see all detected ports.

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is an ESP32 lab project (Haptic Surgical Skill Trainer — Lab 4) with three parts:
 1. **ESP-IDF firmware** (`main/`, `components/`) — C code running on the ESP32 HUZZAH32
 2. **Python desktop GUI** (`gui/`) — PySide6 app running on the host computer
-3. **FSR diagnostic tool** (`tests/fsr_test.py`) — standalone terminal display for force sensor testing
+3. **Diagnostic tools** (`tests/`) — standalone terminal displays for FSR, IMU, and timing checks
 
 ---
 
@@ -36,7 +36,7 @@ Note: `idf.py` is not on PATH by default. Always invoke via `python3 ~/.espressi
 main/
   main.c               — app_main: queue creation, hardware init, task pinning
   data_types.h         — shared structs (raw_sample_t, cal_params_t) and all #defines
-  acquisition.c/.h     — Core 0: 100 Hz timer, ADC (FSR × 3), BNO085, queue post
+  acquisition.c/.h     — Core 0: 100 Hz timer, ADC (FSR × 3), BNO085 UART-RVC, queue post
   processing.c/.h      — Core 1: IIR filters, state machine, thresholds, JSON, commands
   calibration.c/.h     — calibration sub-state machine (C1–C4, NVS save)
   filters.c/.h         — Butterworth biquad IIR: LP 12 Hz, BP 6–12 Hz, LP 10 Hz
@@ -44,8 +44,12 @@ main/
   nvs_storage.c/.h     — NVS load/save for cal_params_t
 
 components/
-  sh2/                 — vendored CEVA BNO085 sh2 driver + ESP-IDF I2C HAL
+  sh2/                 — vendored CEVA BNO085 SH-2 driver, currently disabled
 ```
+
+The active IMU path is UART-RVC, not SH-2/I2C. Do not re-enable `sh2`,
+`esp_driver_i2c`, or `EXTRA_COMPONENT_DIRS` unless the hardware is explicitly moved
+back out of UART-RVC mode.
 
 ---
 
@@ -95,11 +99,24 @@ Example JSON:
  "warn":0,"err":0,"score":100.0,"actual_hz":100.00}
 ```
 
-### IMU-Absent Mode
+`actual_hz` is currently nominal in firmware JSON. For timing proof, use
+`tests/dual_core_monitor.py` or scope GPIO13.
 
-If the BNO085 is not connected, `bno085_init()` probes the I2C address with
-`i2c_master_probe()` (50 ms timeout) before calling `sh2_open()`. On failure it sets
-`s_imu_ok = false` and continues — FSR sampling runs normally, IMU fields are zero.
+### BNO085 UART-RVC Mode
+
+The BNO085 is wired in UART-RVC mode:
+
+- BNO085 P0/PS0 tied to 3.3 V
+- BNO085 P1/PS1 unconnected/low
+- BNO085 SDA → ESP32 GPIO32 (`UART2 RX`)
+- BNO085 SCL → ESP32 GPIO33, but RVC does not need ESP32 TX; firmware leaves GPIO33 as input/pull-up
+- UART2 baud: 115200
+
+The BNO085 samples P0/P1 at reset. After changing mode wiring, power-cycle the IMU;
+resetting only the ESP32 may leave the BNO085 in the previous interface mode.
+
+UART-RVC packets provide yaw, pitch, roll, and acceleration. The firmware zeroes
+`quat[]` and approximates gyro from Euler angle differences at 100 Hz.
 
 ### Force Thresholds (Horeman et al. 2010)
 
@@ -114,16 +131,17 @@ If the BNO085 is not connected, `bno085_init()` probes the I2C address with
 |--------|------|-------|
 | FSR thumb | 34 | ADC1_CH6, input-only |
 | FSR index | 39 | ADC1_CH3, input-only |
-| FSR middle | 32 | ADC1_CH4 |
-| BNO085 SDA | 22 | I2C0 |
-| BNO085 SCL | 20 | I2C0 |
-| BNO085 INT | 15 | falling-edge ISR |
-| Freq proof | 33 | toggled each 100 Hz tick |
+| FSR middle | 36 | ADC1_CH0, input-only |
+| BNO085 SDA | 32 | UART2 RX, BNO085 data out to ESP32 |
+| BNO085 SCL | 33 | BNO085 UART input, unused in RVC; firmware leaves input/pull-up |
+| BNO085 P0/PS0 | 3.3 V | High selects UART-RVC at BNO085 reset |
+| BNO085 P1/PS1 | unconnected | Low by default for UART-RVC |
+| Freq proof | 13 | toggled each 100 Hz tick |
 | Core 1 debug | 12 | toggled each processing cycle |
 
 ---
 
-## FSR Diagnostic Tool
+## Diagnostic Tools
 
 Standalone terminal display — does not require the GUI:
 
@@ -131,6 +149,8 @@ Standalone terminal display — does not require the GUI:
 python tests/fsr_test.py              # auto-detect port
 python tests/fsr_test.py --list-ports # list all serial ports
 python tests/fsr_test.py --log        # also write CSV log
+python tests/imu_test.py              # BNO085 UART-RVC diagnostic
+python tests/dual_core_monitor.py --port /dev/cu.usbserial-XXXX
 ```
 
 Only one process can hold the serial port at a time. Stop `idf.py monitor` before running.

@@ -12,7 +12,7 @@
  * It is a pure consumer: it blocks waiting for raw_sample_t packets
  * from Core 0, processes each one, and emits JSON over UART.
  *
- * Core 1 never touches the ADC, the I2C bus, or the timer semaphore.
+ * Core 1 never touches the ADC, the IMU UART, or the timer semaphore.
  * Those belong to Core 0.  The only shared resource is the FreeRTOS
  * queue (raw_q), which FreeRTOS keeps thread-safe internally.
  *

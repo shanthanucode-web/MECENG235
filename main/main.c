@@ -119,7 +119,7 @@ void app_main(void)
      *   runs here that could introduce jitter.  Priority 10 ensures
      *   the esp_timer task (priority 22) can still pre-empt it to
      *   fire the 100 Hz semaphore, but no lower-priority work competes.
-     *   Stack: 4096 B — only needs ADC reads, I2C calls, and queue post.
+     *   Stack: 4096 B — only needs ADC reads, UART-RVC reads, and queue post.
      *
      * Core 1 — APP CPU — processing_task
      *   Handles all computation, filtering, JSON formatting, and UART I/O.
@@ -131,7 +131,7 @@ void app_main(void)
      */
     xTaskCreatePinnedToCore(acquisition_task,
                             "acq_task",
-                            4096,   /* stack: ADC + I2C + queue post */
+                            4096,   /* stack: ADC + UART-RVC + queue post */
                             NULL,
                             10,     /* priority */
                             NULL,

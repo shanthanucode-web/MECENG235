@@ -11,11 +11,9 @@ idf_component_register(
     REQUIRES
         esp_driver_uart
         esp_driver_gpio
-        esp_driver_i2c
         esp_adc
         nvs_flash
         esp_timer
         freertos
-        sh2
         log
 )
