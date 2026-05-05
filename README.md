@@ -68,6 +68,45 @@ I (208) cpu_start: Pro cpu start user code
 `xTaskCreatePinnedToCore` with explicit core IDs enforces the assignment.
 On a single-core build this function does not exist — its presence is proof of dual-core operation.
 
+### What to look for in the monitor
+
+Open the serial monitor and reset the ESP32. The important lines appear only during
+boot and early task startup, so watch the first few seconds after reset.
+
+This is the expected sequence:
+
+```text
+I (...) boot: Multicore bootloader
+I (...) cpu_start: Multicore app
+I (...) main_task: Started on CPU0
+I (...) ACQ: ACQ TASK: running on Core 0 at 100 Hz
+I (...) PROC: PROC TASK: running on Core 1
+```
+
+How to interpret these lines:
+
+- `boot: Multicore bootloader`
+  - The ESP32 is using the multicore boot path.
+- `cpu_start: Multicore app`
+  - The application image is running in multicore mode.
+- `main_task: Started on CPU0`
+  - ESP-IDF started the initial application task on CPU0.
+- `ACQ TASK: running on Core 0`
+  - The acquisition task is pinned where the firmware expects it.
+- `PROC TASK: running on Core 1`
+  - The processing task is pinned to the second core.
+
+The strongest runtime evidence for this project is seeing both task-placement lines
+after a `Multicore app` boot.
+
+If you do not see the expected lines:
+
+- Make sure you are looking at the serial monitor output, not the build or flash log.
+- Reset the board after opening the monitor.
+- Watch from the very first boot line; these messages do not repeat during normal runtime.
+- If `ACQ TASK` appears but `PROC TASK` does not, the app booted in multicore mode
+  but the processing task either did not start cleanly or its log was missed.
+
 ### How the cores communicate
 
 The only data path between cores is a **FreeRTOS queue** (`QueueHandle_t raw_q`):
@@ -127,7 +166,8 @@ uart_echo_VitalSignsLab4/
 | Motor 1 (force err) | GPIO 26 | NPN driver |
 | Motor 2 (instability) | GPIO 27 | NPN driver |
 | Motor 3 (tremor) | GPIO 14 | NPN driver |
-| Freq proof | GPIO 13 | toggled every 100 Hz tick for scope verification |
+| Built-in status LED | GPIO 13 | command/mode indicator |
+| Freq proof | GPIO 4 / A5 | toggled every 100 Hz tick for scope verification |
 | Core 1 debug | GPIO 12 | toggled every processing cycle |
 
 ### BNO085 UART-RVC wiring notes
@@ -142,6 +182,10 @@ UART-RVC is output-only from the IMU for this project. The required connections 
 
 The BNO085 samples P0/P1 at reset. After changing P0/P1 wiring, power-cycle the IMU;
 resetting only the ESP32 may leave the BNO085 in its previous mode.
+
+Here, "power-cycle the IMU" means removing electrical power from the IMU itself
+for a moment so it fully turns off, then restoring power. Pressing `EN`, rebooting,
+or resetting only the ESP32 does not guarantee that the BNO085 re-reads `P0/P1`.
 
 ---
 
@@ -197,7 +241,7 @@ All communication is over UART0 (115200 baud, GPIO 1=TX, 3=RX).
 
 JSON is output at 20 Hz (every 5th sample) to stay within 115200 baud capacity.
 The `actual_hz` field is currently a nominal firmware value; use
-`tests/dual_core_monitor.py` or a scope on GPIO13 for timing verification.
+`tests/dual_core_monitor.py` or a scope on GPIO4/A5 for timing verification.
 
 ---
 
@@ -238,8 +282,22 @@ python tests/imu_test.py --raw        # show raw JSON lines too
 Monitor software timing:
 
 ```bash
+python tests/dual_core_monitor.py
+python tests/dual_core_monitor.py --list-ports
 python tests/dual_core_monitor.py --port /dev/cu.usbserial-XXXX
 ```
+
+`dual_core_monitor.py` provides software evidence that acquisition timing remains
+stable while processing and UART output are active. It reconstructs the 100 Hz
+acquisition period from firmware timestamps and compares that against the host-side
+JSON receive cadence. This is consistent with the dual-core design, but it is not
+formal proof of multicore execution by itself. The stronger proof is:
+
+- the ESP32 multicore boot log,
+- `xTaskCreatePinnedToCore(..., 0/1)` in the firmware, and
+- hardware observation of the debug pins:
+  - GPIO4 / A5 = Core 0 acquisition heartbeat
+  - GPIO12 = Core 1 processing heartbeat
 
 ---
 
@@ -254,6 +312,26 @@ python gui/esp32_controller.py
 
 ## Troubleshooting
 
+### I only see the flash output, not the boot log
+The ESP-IDF flash task output is not the same thing as the ESP32 runtime monitor output.
+`Flash Done` only means the image was written successfully.
+
+To verify multicore boot and task placement:
+
+1. Open `idf.py monitor` or `ESP-IDF: Monitor Device`.
+2. Press the ESP32 `EN` / reset button.
+3. Watch the first lines printed after reset.
+
+You are looking for:
+
+- `boot: Multicore bootloader`
+- `cpu_start: Multicore app`
+- `ACQ TASK: running on Core 0`
+- `PROC TASK: running on Core 1`
+
+If you open the monitor after the board already booted, reset it again or you will
+miss the boot log.
+
 ### IMU fields stay zero
 The firmware is in BNO085 UART-RVC mode, not I2C/SH-2 mode. Check:
 
@@ -263,8 +341,33 @@ The firmware is in BNO085 UART-RVC mode, not I2C/SH-2 mode. Check:
 - BNO085 and ESP32 share ground.
 - The BNO085 was power-cycled after P0/P1 wiring changed.
 
+What "power-cycled" means in practice:
+
+- Unplug USB from the ESP32, or disconnect the IMU `VIN` / `3.3 V` lead.
+- Wait 1-2 seconds so the IMU fully loses power.
+- Restore power, then test again.
+
+Why this matters:
+
+- The ESP32 can reboot while the BNO085 stays powered.
+- The BNO085 chooses its interface mode only when it powers up or resets.
+- If the IMU never lost power, it may stay in its previous interface mode even if
+  the wiring is now correct.
+
 RVC does not require ESP32 TX. If debugging, disconnect BNO085 SCL from GPIO33 and
 leave only SDA→GPIO32 plus power, ground, and P0 high.
+
+### IMU has power, but still no motion data
+The green LED on the IMU only shows that the board is powered. It does not prove
+that the BNO085 is in UART-RVC mode or transmitting valid packets.
+
+If the IMU LED is on but the JSON `ax/ay/az/roll/pitch/yaw/gx/gy/gz` fields stay zero:
+
+- Verify `P0/PS0` is high before power-up.
+- Prefer tying `P1/PS1` explicitly to GND during bring-up instead of relying on it
+  floating low.
+- Fully remove power from the IMU and power it back on.
+- Run `python tests/imu_test.py --raw` with `idf.py monitor` closed.
 
 ### fsr_test.py connects to wrong port
 Run `python tests/fsr_test.py --list-ports` to see all detected ports.

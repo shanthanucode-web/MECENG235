@@ -10,7 +10,7 @@
 #   actual_acq_period = delta_t_between_packets / 5
 #   (firmware outputs JSON every 5th sample at 100Hz = 20Hz output)
 #
-# GPIO 13 (Core 0 timer tick) and GPIO 12 (Core 1 processing) are the hardware heartbeats.
+# GPIO 4/A5 (Core 0 timer tick) and GPIO 12 (Core 1 processing) are the hardware heartbeats.
 # This script provides the software equivalent without an oscilloscope.
 #
 # Read-only — does not send any commands to the ESP32.
@@ -27,6 +27,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import serial
+import serial.tools.list_ports
 
 # ── Shared state ───────────────────────────────────────────────────────────
 # Each entry: dict of JSON fields + '_rx_time' (monotonic seconds)
@@ -50,6 +51,17 @@ WHITE  = "\033[97m"
 
 
 # ── Serial reader (daemon thread) ──────────────────────────────────────────
+
+def detect_port() -> str | None:
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        if any(k in p.device for k in ("usbserial", "usbmodem", "ttyUSB", "ttyACM")):
+            return p.device
+    SKIP = ("wlan-debug", "Bluetooth", "BTLE", "debug")
+    for p in ports:
+        if "cu." in p.device and not any(s in p.device for s in SKIP):
+            return p.device
+    return None
 
 def _serial_reader(port: str, baud: int) -> None:
     global _connected, _err_count, _total_packets_received
@@ -238,7 +250,7 @@ def _render_terminal() -> None:
 
     print(f"{BOLD}ESP32 Dual-Core Activity Monitor — live serial proof{RESET}")
     print(f"Port source: firmware JSON stream. Period proof: Δ(JSON t) / 5 samples.")
-    print("Hardware pins for external proof: GPIO13 = Core0 tick, GPIO12 = Core1 cycle.")
+    print("Hardware pins for external proof: GPIO4/A5 = Core0 tick, GPIO12 = Core1 cycle.")
     print()
 
     terminal_width = 100
@@ -444,15 +456,30 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="ESP32 dual-core activity monitor (read-only)"
     )
-    parser.add_argument("--port", required=True,
-                        help="Serial port, e.g. /dev/cu.usbserial-XXXX")
+    parser.add_argument("port", nargs="?", default=None,
+                        help="Serial port (auto-detected if omitted)")
     parser.add_argument("--baud", type=int, default=115200,
                         help="Baud rate (default: 115200)")
+    parser.add_argument("--list-ports", action="store_true",
+                        help="List all detected serial ports and exit")
     args = parser.parse_args()
+
+    if args.list_ports:
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            print("No serial ports found.")
+        for p in ports:
+            print(f"  {p.device:35s} {p.description}")
+        sys.exit(0)
+
+    port = args.port or detect_port()
+    if port is None:
+        print(f"{RED}No serial port found. Plug in the ESP32 or pass a port explicitly.{RESET}")
+        sys.exit(1)
 
     # Start serial reader
     reader = threading.Thread(
-        target=_serial_reader, args=(args.port, args.baud), daemon=True
+        target=_serial_reader, args=(port, args.baud), daemon=True
     )
     reader.start()
 

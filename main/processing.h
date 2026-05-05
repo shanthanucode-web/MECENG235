@@ -53,3 +53,11 @@ void processing_init(QueueHandle_t raw_q,
  * Core 1 task entry point — pin with xTaskCreatePinnedToCore(..., 1).
  */
 void processing_task(void *arg);
+
+/*
+ * C1 calibration helper: estimates the no-motion 6-12 Hz gyro RMS baseline
+ * using the same tremor filter shape as the live scorer, but with separate
+ * filter state so calibration does not disturb live scoring.
+ */
+void processing_tremor_baseline_reset(void);
+float processing_tremor_baseline_step(const float gyro_dps[3]);

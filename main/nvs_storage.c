@@ -89,4 +89,5 @@ void nvs_get_defaults(cal_params_t *out)
     out->f95_ref      = 4.8f;   /* Hz */
     out->pp_roll_ref  = 30.0f;  /* deg */
     out->pp_pitch_ref = 20.0f;  /* deg */
+    out->tremor_rms_ref = TREMOR_BASELINE_FLOOR_DPS;
 }

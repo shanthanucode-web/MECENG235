@@ -100,7 +100,7 @@ Example JSON:
 ```
 
 `actual_hz` is currently nominal in firmware JSON. For timing proof, use
-`tests/dual_core_monitor.py` or scope GPIO13.
+`tests/dual_core_monitor.py` or scope GPIO4/A5.
 
 ### BNO085 UART-RVC Mode
 
@@ -136,7 +136,8 @@ UART-RVC packets provide yaw, pitch, roll, and acceleration. The firmware zeroes
 | BNO085 SCL | 33 | BNO085 UART input, unused in RVC; firmware leaves input/pull-up |
 | BNO085 P0/PS0 | 3.3 V | High selects UART-RVC at BNO085 reset |
 | BNO085 P1/PS1 | unconnected | Low by default for UART-RVC |
-| Freq proof | 13 | toggled each 100 Hz tick |
+| Built-in status LED | 13 | command/mode indicator |
+| Freq proof | 4 / A5 | toggled each 100 Hz tick |
 | Core 1 debug | 12 | toggled each processing cycle |
 
 ---

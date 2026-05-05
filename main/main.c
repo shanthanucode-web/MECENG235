@@ -8,6 +8,7 @@
 
 #include "data_types.h"
 #include "acquisition.h"
+#include "led_status.h"
 #include "processing.h"
 #include "motor_control.h"
 #include "nvs_storage.h"
@@ -74,6 +75,7 @@ void app_main(void)
 
     /* ── Hardware init ──────────────────────────────────────────────── */
     ESP_ERROR_CHECK(acquisition_init(raw_q));
+    led_status_init();
     motor_control_init();
 
     /* ── UART driver install ────────────────────────────────────────── */

@@ -1,5 +1,6 @@
 #include "calibration.h"
 #include "nvs_storage.h"
+#include "processing.h"
 
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -11,6 +12,9 @@
 static const char *TAG = "CAL";
 
 #define CAL_QUEUE_TIMEOUT_MS  200   /* max wait per sample before timeout */
+#define CAL_C1_SAMPLES        300
+
+static raw_sample_t s_c1_samples[CAL_C1_SAMPLES];
 
 /* ── Welford online mean/variance ─────────────────────────────────────── */
 typedef struct {
@@ -68,10 +72,22 @@ static void uart_sendf(char *buf, int buf_len, const char *fmt, ...)
 /* ── C1: IMU neutral (3 seconds = 300 samples) ─────────────────────────── */
 static esp_err_t cal_c1(QueueHandle_t raw_q, cal_params_t *params)
 {
-    const int N = 300;
+    const int N = CAL_C1_SAMPLES;
     welford_t wf_omega;
+    welford_t wf_g[3];
+    welford_t wf_roll;
+    welford_t wf_pitch;
+    welford_t wf_yaw;
+    welford_t wf_tremor;
     welford_t wf_quat[4];
     welford_reset(&wf_omega);
+    welford_reset(&wf_roll);
+    welford_reset(&wf_pitch);
+    welford_reset(&wf_yaw);
+    welford_reset(&wf_tremor);
+    for (int k = 0; k < 3; k++) {
+        welford_reset(&wf_g[k]);
+    }
     for (int k = 0; k < 4; k++) {
         welford_reset(&wf_quat[k]);
     }
@@ -89,12 +105,19 @@ static esp_err_t cal_c1(QueueHandle_t raw_q, cal_params_t *params)
             uart_send("{\"cal\":\"C1\",\"status\":\"FAIL\",\"reason\":\"timeout\"}\r\n");
             return ESP_ERR_TIMEOUT;
         }
+        s_c1_samples[i] = samp;
 
         float gx = samp.gyro_dps[0];
         float gy = samp.gyro_dps[1];
         float gz = samp.gyro_dps[2];
         float omega = sqrtf(gx * gx + gy * gy + gz * gz);
         welford_update(&wf_omega, omega);
+        welford_update(&wf_g[0], gx);
+        welford_update(&wf_g[1], gy);
+        welford_update(&wf_g[2], gz);
+        welford_update(&wf_roll, samp.euler_deg[0]);
+        welford_update(&wf_pitch, samp.euler_deg[1]);
+        welford_update(&wf_yaw, samp.euler_deg[2]);
 
         for (int k = 0; k < 4; k++) {
             welford_update(&wf_quat[k], samp.quat[k]);
@@ -108,22 +131,59 @@ static esp_err_t cal_c1(QueueHandle_t raw_q, cal_params_t *params)
     }
 
     float rms_omega = wf_omega.mean; /* mean of magnitudes ≈ RMS for small angles */
-    /* orientation spread: std dev of roll proxy (quat[1] = x component) */
-    float spread = welford_stddev(&wf_quat[1]) * 57.2957795f * 2.0f;
+    float spread = welford_stddev(&wf_roll);
+    float pitch_spread = welford_stddev(&wf_pitch);
+    float yaw_spread = welford_stddev(&wf_yaw);
+    if (pitch_spread > spread) {
+        spread = pitch_spread;
+    }
+    if (yaw_spread > spread) {
+        spread = yaw_spread;
+    }
+    float gyro_bias[3] = {
+        wf_g[0].mean,
+        wf_g[1].mean,
+        wf_g[2].mean,
+    };
+    processing_tremor_baseline_reset();
+    for (int i = 0; i < N; i++) {
+        float unbiased[3] = {
+            s_c1_samples[i].gyro_dps[0] - gyro_bias[0],
+            s_c1_samples[i].gyro_dps[1] - gyro_bias[1],
+            s_c1_samples[i].gyro_dps[2] - gyro_bias[2],
+        };
+        float tremor_mag = processing_tremor_baseline_step(unbiased);
+        if (i >= 50) { /* skip filter warm-up */
+            welford_update(&wf_tremor, tremor_mag);
+        }
+    }
+    float tremor_baseline = wf_tremor.mean + 3.0f * welford_stddev(&wf_tremor);
+    if (tremor_baseline < TREMOR_BASELINE_FLOOR_DPS) {
+        tremor_baseline = TREMOR_BASELINE_FLOOR_DPS;
+    }
 
-    bool pass = (rms_omega <= 3.0f) && (spread <= 2.0f);
+    bool pass = (rms_omega <= 5.0f) && (spread <= 5.0f);
 
-    /* Store gyro bias (mean of each axis during neutral) and neutral quaternion */
-    params->gyro_bias[0] = 0.0f; /* bias estimation needs raw data, use 0 as placeholder */
-    params->gyro_bias[1] = 0.0f;
-    params->gyro_bias[2] = 0.0f;
+    /* Store no-motion IMU references. In UART-RVC mode quat[] is unavailable,
+     * so keep an identity neutral quaternion and store gyro/tremor baselines. */
+    params->gyro_bias[0] = gyro_bias[0];
+    params->gyro_bias[1] = gyro_bias[1];
+    params->gyro_bias[2] = gyro_bias[2];
+    params->tremor_rms_ref = tremor_baseline;
     for (int k = 0; k < 4; k++) {
         params->q_neutral[k] = wf_quat[k].mean;
     }
+    if (fabsf(params->q_neutral[0]) < 1e-6f &&
+        fabsf(params->q_neutral[1]) < 1e-6f &&
+        fabsf(params->q_neutral[2]) < 1e-6f &&
+        fabsf(params->q_neutral[3]) < 1e-6f) {
+        params->q_neutral[0] = 1.0f;
+    }
 
     uart_sendf(buf, sizeof(buf),
-               "{\"cal\":\"C1\",\"status\":\"%s\",\"rms_omega\":%.3f,\"spread\":%.3f}\r\n",
-               pass ? "PASS" : "FAIL", rms_omega, spread);
+               "{\"cal\":\"C1\",\"status\":\"%s\",\"rms_omega\":%.3f,"
+               "\"spread\":%.3f,\"tremor_ref\":%.3f}\r\n",
+               pass ? "PASS" : "FAIL", rms_omega, spread, tremor_baseline);
 
     return pass ? ESP_OK : ESP_FAIL;
 }

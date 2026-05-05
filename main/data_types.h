@@ -19,7 +19,8 @@
 #define GPIO_MOTOR1      GPIO_NUM_26
 #define GPIO_MOTOR2      GPIO_NUM_27
 #define GPIO_MOTOR3      GPIO_NUM_14
-#define GPIO_FREQ_PROOF  GPIO_NUM_13  /* toggled every timer ISR for frequency verification */
+#define GPIO_STATUS_LED  GPIO_NUM_13  /* built-in Feather/HUZZAH32 user LED */
+#define GPIO_FREQ_PROOF  GPIO_NUM_4   /* A5 — toggled every timer ISR for frequency verification */
 #define GPIO_DBG_CORE1   GPIO_NUM_12  /* toggled every Core 1 processing cycle */
 
 /* ── IMU — BNO085 UART-RVC ────────────────────────────────────────────── */
@@ -75,6 +76,7 @@ typedef struct {
     float f95_ref;         /* 95% power frequency reference (Hz) */
     float pp_roll_ref;     /* peak-to-peak roll reference (deg) */
     float pp_pitch_ref;    /* peak-to-peak pitch reference (deg) */
+    float tremor_rms_ref;  /* no-motion 6-12 Hz gyro RMS baseline from C1 (deg/s) */
 } cal_params_t;
 
 /* ── Clinical force thresholds (Horeman et al. 2010) ────────────────────── */
@@ -96,6 +98,15 @@ typedef struct {
 #define FORCE_MED_ERR_X     3.5f
 #define FORCE_HARD_WARN_X   1.5f
 #define FORCE_HARD_ERR_X    2.5f
+
+/* Tremor mode thresholds. Values are applied above the C1 no-motion baseline. */
+#define TREMOR_EASY_WARN_DPS   18.0f
+#define TREMOR_EASY_ERR_DPS    28.0f
+#define TREMOR_MED_WARN_DPS    12.0f
+#define TREMOR_MED_ERR_DPS     20.0f
+#define TREMOR_HARD_WARN_DPS    8.0f
+#define TREMOR_HARD_ERR_DPS    14.0f
+#define TREMOR_BASELINE_FLOOR_DPS  3.0f
 
 /* ── Warning / error bitmasks ────────────────────────────────────────────── */
 #define WARN_HOLD_INSTABILITY   (1u << 0)

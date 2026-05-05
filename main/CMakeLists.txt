@@ -5,6 +5,7 @@ idf_component_register(
         "processing.c"
         "calibration.c"
         "filters.c"
+        "led_status.c"
         "motor_control.c"
         "nvs_storage.c"
     INCLUDE_DIRS "."
