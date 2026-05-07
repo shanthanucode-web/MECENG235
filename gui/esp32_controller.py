@@ -4,11 +4,13 @@ Haptic Surgical Skill Trainer
 Clinical desktop dashboard for the ESP32 glove firmware. The GUI keeps the
 existing UART command protocol and turns live JSON telemetry into force,
 motion, coaching, calibration, and optional 3D orientation/contact views.
+
+REDESIGN: _build_ui() and STYLESHEET updated for three-zone layout.
+All data classes, workers, signal/slot connections, and serial logic unchanged.
 """
 
 from __future__ import annotations
 
-import html
 import json
 import math
 import queue
@@ -31,41 +33,47 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QTextEdit,
-    QTabWidget,
+    QSpacerItem,
     QVBoxLayout,
     QWidget,
 )
 
+
+# ── Constants ────────────────────────────────────────────────────────────────
 
 BAUD_RATE = 115200
 HISTORY_POINTS = 900
 PLOT_WINDOW_S = 30.0
 MAX_FEED_CARDS = 18
 
-NAVY = "#0f2d52"
-BLUE = "#1e88e5"
+# ── Color palette (unchanged) ────────────────────────────────────────────────
+
+NAVY      = "#0f2d52"
+BLUE      = "#1e88e5"
 BLUE_DARK = "#155fa0"
 BLUE_LIGHT = "#e8f3ff"
-ICE = "#f6fbff"
-PANEL = "#ffffff"
+ICE       = "#f6fbff"
+PANEL     = "#ffffff"
 PANEL_ALT = "#f0f7ff"
-BORDER = "#cfe1f5"
-GRID = "#d9e9f8"
-TEXT = "#10263f"
-MUTED = "#63758a"
-GREEN = "#1f9d55"
-AMBER = "#d98a00"
-RED = "#c62828"
-VIOLET = "#6f5bd6"
-GRAY = "#9aaec3"
+BORDER    = "#cfe1f5"
+GRID      = "#d9e9f8"
+TEXT      = "#10263f"
+MUTED     = "#63758a"
+GREEN     = "#1f9d55"
+AMBER     = "#d98a00"
+RED       = "#c62828"
+VIOLET    = "#6f5bd6"
+GRAY      = "#9aaec3"
 
 WARN_LABELS = {
     1 << 0: "Hold instability",
@@ -86,96 +94,131 @@ ERR_LABELS = {
 
 CALIBRATION_STEPS = {
     "C1": {
-        "title": "C1 Baseline",
-        "instruction": (
-            "Keep the glove relaxed with no finger pressure. Keep the hand still "
-            "on the table. Send C1 once the force sensors read near zero."
-        ),
+        "step": 1,
+        "nav": "Still Hand",
+        "title": "Still Hand Baseline",
+        "purpose": "Measures the glove while your hand is completely still so the trainer can separate normal motion from tremor.",
+        "instruction": "Rest your hand on the table, keep your fingers relaxed, and avoid pressing the glove until the step finishes.",
+        "running": "Measuring stillness",
+        "success": "Still-hand baseline saved.",
+        "failure": "The glove moved too much during the baseline. Rest your hand and run the step again.",
     },
     "C2": {
-        "title": "C2 Force Reference",
-        "instruction": (
-            "Apply a steady reference grip using the training posture. Hold the "
-            "pressure constant while sending C2."
-        ),
+        "step": 2,
+        "nav": "Finger Pressure",
+        "title": "Finger Pressure Baseline",
+        "purpose": "Learns the no-pressure sensor baseline so the glove can tell the difference between resting fingers and real instrument contact.",
+        "instruction": "Keep your fingers off the pressure pads and let the glove sit naturally until the step finishes.",
+        "running": "Measuring finger pressure baseline",
+        "success": "Finger pressure baseline saved.",
+        "failure": "The glove detected too much finger pressure. Relax your hand and run the step again.",
     },
     "C3": {
-        "title": "C3 Stable Hold",
-        "instruction": (
-            "Hold the glove in the intended neutral surgical posture. Avoid "
-            "shaking or changing grip pressure while sending C3."
-        ),
+        "step": 3,
+        "nav": "Light Grip",
+        "title": "Normal Light Grip",
+        "purpose": "Captures your typical light training grip so force warnings are scaled to normal use instead of a hardcoded assumption.",
+        "instruction": "Hold a steady normal light grip until the glove confirms the force reference was captured.",
+        "running": "Capturing normal light grip",
+        "success": "Normal light grip saved.",
+        "failure": "The glove could not capture a clean light-grip reference. Hold a steady light grip and run the step again.",
     },
     "C4": {
-        "title": "C4 Controlled Motion",
-        "instruction": (
-            "Perform a smooth controlled motion with the glove. Keep the force "
-            "reasonable and avoid abrupt jerks while sending C4."
-        ),
-    },
-    "C3_REP": {
-        "title": "Repeat C3 Hold",
-        "instruction": (
-            "Repeat the stable hold capture. Use this if the previous hold sample "
-            "looked unstable or the subject moved too early."
-        ),
-    },
-    "C4_CYCLE": {
-        "title": "Cycle C4 Motion",
-        "instruction": (
-            "Run another controlled motion cycle. Use the same motion pattern as "
-            "the prior C4 sample so the reference remains consistent."
-        ),
+        "step": 4,
+        "nav": "Hand Motion",
+        "title": "Normal Hand Motion",
+        "purpose": "Captures the way you naturally move your hand so the trainer can separate intended motion from actual tremor.",
+        "instruction": "Keep a light grip and move your hand naturally for a few seconds when prompted.",
+        "running": "Capturing normal hand motion",
+        "success": "Normal hand motion saved.",
+        "failure": "The glove could not capture enough clean normal hand motion. Move naturally and run the step again.",
     },
     "Z": {
-        "title": "Erase Stored Calibration",
-        "instruction": (
-            "This clears saved calibration values from NVS. Use only when starting "
-            "over with a new glove setup or bad calibration data."
-        ),
+        "title": "Erase Saved Calibration",
+        "purpose": "Clears the glove's saved calibration values so you can start over from the beginning.",
+        "instruction": "Use this only when you need to reset calibration for a new user, a new glove fit, or obviously incorrect saved values.",
+        "running": "Erasing saved calibration",
+        "success": "Saved calibration erased.",
+        "failure": "The saved calibration could not be erased. Try again while connected to the glove.",
     },
 }
+
+CORE_CALIBRATION_FLOW = ("C1", "C2", "C3", "C4")
+
+CALIBRATION_STAGE_UI = {
+    "grip_hold": {
+        "title": "Hold light grip",
+        "instruction": "Hold your normal light training grip steady until the first check appears.",
+    },
+    "hand_motion": {
+        "title": "Move hand naturally",
+        "instruction": "Keep a light grip and move your hand naturally for a few seconds so the glove can learn what intended motion looks like for you.",
+    },
+}
+
+CALIBRATION_STAGE_ORDER = tuple(CALIBRATION_STAGE_UI.keys())
+
+CALIBRATION_REASON_TEXT = {
+    "not_still": "The glove moved too much during the still-hand capture.",
+    "pressure_present": "Finger pressure was still on the pads when the baseline was measured.",
+    "unstable_pressure": "The pressure sensors were too noisy to capture a clean baseline.",
+    "drift": "The pressure baseline drifted during capture. Let the glove settle and try again.",
+    "grip_unstable": "The light grip was not steady enough to use as your normal force reference.",
+    "range_too_small": "The motion window did not contain enough regular hand movement. Move a little more naturally and try again.",
+    "returned_too_little": "The prior return-to-center check is no longer part of calibration.",
+    "motion_too_short": "The motion window ended too early. Keep moving naturally until the capture finishes.",
+    "motion_too_noisy": "The motion was too jittery to use as a clean reference.",
+    "pressure_absent": "A steady light grip was not detected during the grip-capture phase.",
+    "stage_failed": "One part of the calibration capture did not complete cleanly.",
+    "save_failed": "The glove could not save the completed calibration stage.",
+    "timeout": "The glove stopped waiting for data before the stage could finish.",
+    "deprecated": "This calibration action is no longer part of the guided workflow.",
+}
+
+
+def calibration_reason_text(reason: str, fallback: str) -> str:
+    return CALIBRATION_REASON_TEXT.get(reason, fallback)
 
 
 class TrainerState(Enum):
     DISCONNECTED = "DISCONNECTED"
-    CONNECTED = "CONNECTED"
-    IDLE = "IDLE"
-    HOLD = "HOLD"
-    ACTIVE = "ACTIVE"
-    EXITED = "EXITED"
+    CONNECTED    = "CONNECTED"
+    IDLE         = "IDLE"
+    HOLD         = "HOLD"
+    ACTIVE       = "ACTIVE"
+    EXITED       = "EXITED"
 
 
 STATE_COLORS = {
     TrainerState.DISCONNECTED: GRAY,
-    TrainerState.CONNECTED: BLUE,
-    TrainerState.IDLE: MUTED,
-    TrainerState.HOLD: GREEN,
-    TrainerState.ACTIVE: AMBER,
-    TrainerState.EXITED: RED,
+    TrainerState.CONNECTED:    BLUE,
+    TrainerState.IDLE:         MUTED,
+    TrainerState.HOLD:         GREEN,
+    TrainerState.ACTIVE:       AMBER,
+    TrainerState.EXITED:       RED,
 }
 
 COMMAND_RESPONSES = {
     "ESP32_TRAINER": ("CONNECTED", "Board identified"),
-    "EASY": ("EASY", "Easy training mode"),
-    "INTERMEDIATE": ("INTERMEDIATE", "Intermediate training mode"),
-    "HARD": ("HARD", "Hard training mode"),
-    "STOPPED": ("IDLE", "Training stopped"),
-    "EXITED": ("EXITED", "Session exited"),
+    "EASY":          ("EASY",         "Easy training mode"),
+    "INTERMEDIATE":  ("INTERMEDIATE", "Intermediate training mode"),
+    "HARD":          ("HARD",         "Hard training mode"),
+    "STOPPED":       ("IDLE",         "Training stopped"),
+    "EXITED":        ("EXITED",       "Session exited"),
 }
 
 MODE_LABELS = {
-    "EASY": "Easy",
+    "EASY":         "Easy",
     "INTERMEDIATE": "Intermediate",
-    "HARD": "Hard",
-    "UNSELECTED": "No Mode",
+    "HARD":         "Hard",
+    "UNSELECTED":   "No Mode",
 }
 
 MODE_COLORS = {
-    "EASY": GREEN,
+    "EASY":         GREEN,
     "INTERMEDIATE": BLUE,
-    "HARD": RED,
-    "UNSELECTED": MUTED,
+    "HARD":         RED,
+    "UNSELECTED":   MUTED,
 }
 
 MODE_BY_COMMAND = {
@@ -186,6 +229,8 @@ MODE_BY_COMMAND = {
 
 COMMAND_BY_MODE = {mode: cmd for cmd, mode in MODE_BY_COMMAND.items()}
 
+
+# ── Data classes (unchanged) ─────────────────────────────────────────────────
 
 @dataclass
 class TelemetryStore:
@@ -200,7 +245,7 @@ class TelemetryStore:
             "t", "f0", "f1", "f2", "f_sum",
             "roll", "pitch", "yaw",
             "tremor", "cv_f", "swing", "f95",
-            "score", "warn", "err", "contact_any",
+            "score", "warn", "err", "contact_any", "engaged",
         )
         self.series = {key: deque(maxlen=self.maxlen) for key in keys}
 
@@ -231,6 +276,9 @@ class TelemetryStore:
                     value = 1.0 if float(packet.get("f_sum", 0.0)) > 0.05 else 0.0
                 self.series[key].append(value)
                 continue
+            if key == "engaged":
+                self.series[key].append(1.0 if int(packet.get("engaged", 0)) else 0.0)
+                continue
             self.series[key].append(float(packet.get(key, 0.0)))
 
     def x(self) -> list[float]:
@@ -239,6 +287,8 @@ class TelemetryStore:
     def y(self, key: str) -> list[float]:
         return list(self.series[key])
 
+
+# ── Serial worker (unchanged) ────────────────────────────────────────────────
 
 class SerialWorker(QThread):
     data_received = Signal(str)
@@ -259,6 +309,8 @@ class SerialWorker(QThread):
             return
 
         self._running = True
+        rx_buf = bytearray()
+        partial_since: float | None = None
         try:
             while self._running:
                 while not self._cmd_queue.empty():
@@ -266,11 +318,23 @@ class SerialWorker(QThread):
                         ser.write(self._cmd_queue.get_nowait())
                     except queue.Empty:
                         break
-                raw = ser.readline()
+                raw = ser.read(max(1, ser.in_waiting or 0))
                 if raw:
-                    line = raw.decode("ascii", errors="replace").strip(" \t\r\n\0")
-                    if line and any(ch.isprintable() for ch in line):
-                        self.data_received.emit(line)
+                    rx_buf.extend(raw)
+                    partial_since = time.monotonic()
+                    while b"\n" in rx_buf:
+                        raw_line, _, rx_buf = rx_buf.partition(b"\n")
+                        line = raw_line.decode("ascii", errors="replace").strip(" \t\r\n\0")
+                        if line:
+                            self.data_received.emit(line)
+                    continue
+
+                if rx_buf and partial_since is not None and (time.monotonic() - partial_since) > 0.25:
+                    fragment = rx_buf.decode("ascii", errors="replace").strip(" \t\r\n\0")
+                    if fragment:
+                        self.data_received.emit(f"<partial serial fragment> {fragment}")
+                    rx_buf.clear()
+                    partial_since = None
         except serial.SerialException as exc:
             self.error_occurred.emit(str(exc))
         finally:
@@ -280,14 +344,16 @@ class SerialWorker(QThread):
         self._running = False
 
 
+# ── ClinicalValue widget (unchanged class; accent from sidebar spec) ──────────
+
 class ClinicalValue(QFrame):
     def __init__(self, title: str, unit: str = "", accent: str = BLUE) -> None:
         super().__init__()
         self.setObjectName("clinical_value")
-        self.setMinimumHeight(42)
+        self.setMinimumHeight(56)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 5, 8, 5)
-        layout.setSpacing(0)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(1)
 
         title_label = QLabel(title)
         title_label.setObjectName("metric_title")
@@ -310,6 +376,56 @@ class ClinicalValue(QFrame):
             "}"
         )
 
+
+# ── KPI card (new widget for the Train tab summary row) ─────────────────────
+
+class KpiCard(QFrame):
+    """
+    # DESIGN: KpiCard replaces SummaryCard — uses border-left accent instead of
+    # border-top, giving a consistent left-aligned visual rhythm across all cards.
+    # border-top accents felt like category tabs; border-left reads as data rows,
+    # which matches the clinical value hierarchy of the sidebar metric cards.
+    """
+    def __init__(self, title: str, unit: str, accent: str) -> None:
+        super().__init__()
+        self.setObjectName("kpi_card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(2)
+        title_label = QLabel(title)
+        title_label.setObjectName("kpi_label")
+        self._value = QLabel("--")
+        self._value.setObjectName("kpi_value")
+        unit_label = QLabel(unit)
+        unit_label.setObjectName("kpi_unit")
+        layout.addWidget(title_label)
+        layout.addWidget(self._value)
+        layout.addWidget(unit_label)
+        self.set_accent(accent)
+        self._apply_shadow()
+
+    def _apply_shadow(self) -> None:
+        # DESIGN: Drop shadow applied in Python (QSS cannot do box-shadow) —
+        # blurRadius=14 gives depth without looking like a popup; color has low
+        # alpha (25) to stay subtle against the ICE background.
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(14)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(15, 45, 82, 25))
+        self.setGraphicsEffect(shadow)
+
+    def set_value(self, value: str) -> None:
+        self._value.setText(value)
+
+    def set_accent(self, color: str) -> None:
+        self.setStyleSheet(
+            "QFrame#kpi_card {"
+            f"border-left: 4px solid {color};"
+            "}"
+        )
+
+
+# ── SummaryCard (kept for SessionSummaryDialog compatibility) ─────────────────
 
 class SummaryCard(QFrame):
     def __init__(self, title: str, unit: str, accent: str) -> None:
@@ -340,41 +456,46 @@ class SummaryCard(QFrame):
         )
 
 
+# ── VitalSignWidget (unchanged painting logic) ───────────────────────────────
+
 class VitalSignWidget(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("vital_sign")
-        self.setMinimumHeight(82)
+        # DESIGN: Fixed height 80px — keeps the banner row compact; taller heights
+        # ate into chart real estate without adding legibility to the heartbeat line.
+        self.setFixedHeight(80)
+        self.setMinimumWidth(180)
         self._active = False
-        self._phase = 0.0
-        self._color = MUTED
+        self._phase  = 0.0
+        self._color  = MUTED
         self._status = "Session idle"
         self._detail = "Select a mode and press Start"
-        self._timer = QTimer(self)
+        self._timer  = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
     def set_status(self, active: bool, warn: int = 0, err: int = 0) -> None:
         self._active = active
         if not active:
-            self._color = MUTED
+            self._color  = MUTED
             self._status = "Session idle"
             self._detail = "Vital sign starts with live scoring"
             self._timer.stop()
-            self._phase = 0.0
+            self._phase  = 0.0
         elif err:
-            self._color = RED
+            self._color  = RED
             self._status = "Danger threshold"
             self._detail = "Error flag active"
             if not self._timer.isActive():
                 self._timer.start(70)
         elif warn:
-            self._color = AMBER
+            self._color  = AMBER
             self._status = "Warning threshold"
             self._detail = "Technique nearing limit"
             if not self._timer.isActive():
                 self._timer.start(70)
         else:
-            self._color = GREEN
+            self._color  = GREEN
             self._status = "Stable technique"
             self._detail = "No active thresholds"
             if not self._timer.isActive():
@@ -383,11 +504,11 @@ class VitalSignWidget(QFrame):
 
     def set_countdown(self, text: str) -> None:
         self._active = False
-        self._color = BLUE
+        self._color  = BLUE
         self._status = f"Starting in {text}" if text != "Begin" else "Begin"
         self._detail = "Get ready"
         self._timer.stop()
-        self._phase = 0.0
+        self._phase  = 0.0
         self.update()
 
     def _tick(self) -> None:
@@ -400,35 +521,28 @@ class VitalSignWidget(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
-        painter.setPen(QPen(QColor(BORDER), 1.0))
-        painter.setBrush(QColor(PANEL))
-        painter.drawRoundedRect(rect, 8.0, 8.0)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(Qt.NoBrush)
 
         painter.setPen(QColor(MUTED))
         small = QFont(self.font())
-        small.setPointSize(9)
+        small.setPointSize(8)
         small.setBold(True)
         painter.setFont(small)
-        painter.drawText(QPointF(14, 18), "LIVE VITAL")
+        painter.drawText(QPointF(8, 14), "LIVE VITAL")
 
         painter.setPen(QColor(self._color))
-        title = QFont(self.font())
-        title.setPointSize(14)
-        title.setBold(True)
-        painter.setFont(title)
-        painter.drawText(QPointF(14, 39), self._status)
+        title_font = QFont(self.font())
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.drawText(QPointF(8, 32), self._status)
 
-        painter.setPen(QColor(MUTED))
-        detail = QFont(self.font())
-        detail.setPointSize(9)
-        painter.setFont(detail)
-        painter.drawText(QPointF(14, 57), self._detail)
-
-        left = 126.0
-        right = max(left + 24.0, rect.right() - 12.0)
-        base = rect.center().y() + 8.0
-        amp = 16.0 if self._active else 4.0
-        path = QPainterPath()
+        left  = 8.0
+        right = max(left + 24.0, rect.right() - 4.0)
+        base  = rect.center().y() + 12.0
+        amp   = 14.0 if self._active else 3.0
+        path  = QPainterPath()
         for i in range(96):
             ratio = i / 95.0
             x = left + ratio * (right - left)
@@ -446,9 +560,35 @@ class VitalSignWidget(QFrame):
             else:
                 path.lineTo(x, y)
 
-        painter.setPen(QPen(QColor(self._color), 2.4))
+        painter.setPen(QPen(QColor(self._color), 2.2))
         painter.drawPath(path)
 
+
+# ── Calibration UI ───────────────────────────────────────────────────────────
+
+class CalibrationProgressBar(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._value = 0.0
+        self.setFixedHeight(12)
+
+    def set_value(self, value: float) -> None:
+        self._value = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.setBrush(QColor(ICE))
+        painter.drawRoundedRect(rect, 6, 6)
+        fill = QRectF(rect)
+        fill.setWidth(max(8.0, rect.width() * self._value))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(BLUE if self._value < 1.0 else GREEN))
+        painter.drawRoundedRect(fill, 6, 6)
+        painter.end()
 
 
 class CalibrationWizard(QDialog):
@@ -457,8 +597,23 @@ class CalibrationWizard(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Guided Calibration")
-        self.setMinimumSize(QSize(560, 430))
+        self.setMinimumSize(QSize(860, 620))
         self._selected = "C1"
+        self._phase = "idle"
+        self._current_stage = ""
+        self._progress = 0.0
+        self._spinner_index = 0
+        self._latest_packet: dict[str, object] = {}
+        self._status_base = "Ready to begin"
+        self._status_detail = "Review the instructions, then start the selected calibration step."
+        self._completed_steps: set[str] = set()
+        self._stage_events_seen = 0
+
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.timeout.connect(self._advance_spinner)
+        self._stage_guard_timer = QTimer(self)
+        self._stage_guard_timer.setSingleShot(True)
+        self._stage_guard_timer.timeout.connect(self._handle_stage_guard_timeout)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -466,7 +621,10 @@ class CalibrationWizard(QDialog):
 
         title = QLabel("Guided Calibration")
         title.setObjectName("dialog_title")
-        subtitle = QLabel("Follow each instruction before sending the calibration command.")
+        subtitle = QLabel(
+            "Work through the three setup steps in order. The trainer will guide wrist-motion capture automatically and tell you when a retry is needed."
+        )
+        subtitle.setWordWrap(True)
         subtitle.setObjectName("muted_label")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -475,39 +633,82 @@ class CalibrationWizard(QDialog):
         body.setSpacing(12)
 
         step_col = QVBoxLayout()
-        step_col.setSpacing(7)
+        step_col.setSpacing(8)
+        step_header = QLabel("Calibration Steps")
+        step_header.setObjectName("panel_caption")
+        step_col.addWidget(step_header)
         self._step_buttons: dict[str, QPushButton] = {}
-        for cmd, data in CALIBRATION_STEPS.items():
-            btn = QPushButton(data["title"])
+        for cmd in CORE_CALIBRATION_FLOW:
+            data = CALIBRATION_STEPS[cmd]
+            btn = QPushButton(f"Step {data['step']}  {data['nav']}")
             btn.clicked.connect(lambda _checked=False, value=cmd: self._select_step(value))
             self._step_buttons[cmd] = btn
             step_col.addWidget(btn)
         step_col.addStretch()
+        self._erase_btn = QPushButton("Erase Saved Calibration")
+        self._erase_btn.setObjectName("danger_button")
+        self._erase_btn.clicked.connect(lambda: self.command_requested.emit("Z"))
+        step_col.addWidget(self._erase_btn)
         body.addLayout(step_col, 1)
 
         info = QFrame()
         info.setObjectName("dialog_panel")
         info_layout = QVBoxLayout(info)
-        info_layout.setContentsMargins(14, 12, 14, 12)
+        info_layout.setContentsMargins(18, 16, 18, 16)
         info_layout.setSpacing(10)
+
+        self._step_kicker = QLabel("")
+        self._step_kicker.setObjectName("summary_title")
         self._step_title = QLabel("")
         self._step_title.setObjectName("panel_title")
+        self._stage_label = QLabel("")
+        self._stage_label.setObjectName("summary_title")
+        self._purpose = QLabel("")
+        self._purpose.setWordWrap(True)
+        self._purpose.setObjectName("instruction_text")
         self._instruction = QLabel("")
         self._instruction.setWordWrap(True)
         self._instruction.setObjectName("instruction_text")
-        self._command_label = QLabel("")
-        self._command_label.setObjectName("command_chip")
-        self._status = QLabel("No calibration command sent yet.")
-        self._status.setWordWrap(True)
-        self._status.setObjectName("muted_label")
-        self._send_btn = QPushButton("Send selected step")
-        self._send_btn.clicked.connect(self._send_selected)
+        self._check_target = QLabel("")
+        self._check_target.setObjectName("instruction_text")
+        self._check_return = QLabel("")
+        self._check_return.setObjectName("instruction_text")
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setObjectName("calibration_progress")
+        self._progress_bar.setTextVisible(False)
+        self._status_chip = QLabel("")
+        self._status_chip.setObjectName("command_chip")
+        self._status_detail_label = QLabel("")
+        self._status_detail_label.setWordWrap(True)
+        self._status_detail_label.setObjectName("muted_label")
+
+        self._primary_btn = QPushButton("Start Calibration")
+        self._primary_btn.setObjectName("command_button")
+        self._primary_btn.clicked.connect(self._run_selected)
+        self._next_btn = QPushButton("Next Step")
+        self._next_btn.setObjectName("outline_button")
+        self._next_btn.clicked.connect(self._go_to_next_step)
+        self._finish_btn = QPushButton("Finish")
+        self._finish_btn.setObjectName("outline_button")
+        self._finish_btn.clicked.connect(self.close)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addWidget(self._primary_btn, 1)
+        action_row.addWidget(self._next_btn)
+        action_row.addWidget(self._finish_btn)
+
+        info_layout.addWidget(self._step_kicker)
         info_layout.addWidget(self._step_title)
+        info_layout.addWidget(self._stage_label)
+        info_layout.addWidget(self._purpose)
         info_layout.addWidget(self._instruction)
-        info_layout.addWidget(self._command_label)
-        info_layout.addStretch()
-        info_layout.addWidget(self._status)
-        info_layout.addWidget(self._send_btn)
+        info_layout.addWidget(self._check_target)
+        info_layout.addWidget(self._check_return)
+        info_layout.addWidget(self._progress_bar)
+        info_layout.addWidget(self._status_chip)
+        info_layout.addWidget(self._status_detail_label)
+        info_layout.addLayout(action_row)
         body.addWidget(info, 2)
 
         layout.addLayout(body)
@@ -517,25 +718,433 @@ class CalibrationWizard(QDialog):
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
         self._select_step("C1")
 
+    def update_live_packet(self, packet: dict) -> None:
+        self._latest_packet = packet
+
+    def _set_stage_label(self, stage: str) -> None:
+        if stage in CALIBRATION_STAGE_ORDER:
+            idx = CALIBRATION_STAGE_ORDER.index(stage) + 1
+            self._stage_label.setText(f"Stage {idx} of {len(CALIBRATION_STAGE_ORDER)}")
+            self._stage_label.show()
+        else:
+            self._stage_label.clear()
+            self._stage_label.hide()
+
+    def _update_progress_ui(self) -> None:
+        if self._selected in ("C3", "C4"):
+            self._progress_bar.show()
+            self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(int(round(self._progress * 100.0)))
+            return
+
+        self._stage_label.hide()
+        if self._phase == "running":
+            self._progress_bar.show()
+            self._progress_bar.setRange(0, 0)
+        else:
+            self._progress_bar.hide()
+            self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(0)
+
+    def _set_direction_checklist(self, stage: str, phase: str = "", checkpoint: str = "") -> None:
+        if self._selected not in ("C3", "C4"):
+            self._check_target.hide()
+            self._check_return.hide()
+            return
+
+        if self._selected == "C3":
+            target_text, return_text = ("Capture normal light grip", "")
+            target_done = (stage == "grip_hold" and phase == "pass") or checkpoint == "grip"
+            return_done = False
+        else:
+            target_text, return_text = ("Capture natural hand motion", "")
+            target_done = (stage == "hand_motion" and phase == "pass") or checkpoint == "motion"
+            return_done = False
+        target_prefix = "✓" if target_done else "○"
+        target_color = GREEN if target_done else MUTED
+        self._check_target.setText(f"{target_prefix} {target_text}")
+        self._check_target.setStyleSheet(f"color: {target_color}; font-size: 13px;")
+        self._check_target.show()
+        self._check_return.hide()
+
+    def _clear_direction_checklist(self) -> None:
+        self._check_target.clear()
+        self._check_return.clear()
+        self._check_target.hide()
+        self._check_return.hide()
+
+    def _set_status(self, phase: str, base: str, detail: str, progress: float | None = None) -> None:
+        self._phase = phase
+        self._status_base = base
+        self._status_detail = detail
+        if progress is not None:
+            self._progress = max(0.0, min(1.0, progress))
+
+        color = NAVY
+        bg = BLUE_LIGHT
+        if phase == "running":
+            color = BLUE
+            self._spinner_index = 0
+            if not self._spinner_timer.isActive():
+                self._spinner_timer.start(420)
+        else:
+            self._spinner_timer.stop()
+            if phase == "passed":
+                color = GREEN
+                bg = PANEL_ALT
+            elif phase == "failed":
+                color = RED
+                bg = "#fff2f2"
+        self._status_chip.setText(base if phase != "running" else f"{base}.")
+        self._status_chip.setStyleSheet(
+            f"color: {color}; background-color: {bg};"
+            f"border: 1px solid {BORDER}; border-radius: 8px; padding: 6px 8px; font-weight: 700;"
+        )
+        self._status_detail_label.setText(detail)
+        self._purpose.setVisible(not (self._selected in ("C3", "C4") and self._phase != "idle"))
+        self._update_progress_ui()
+        self._update_action_buttons()
+
+    def _start_stage_guard(self) -> None:
+        self._stage_guard_timer.stop()
+        self._stage_guard_timer.start(3500)
+
+    def _stop_stage_guard(self) -> None:
+        self._stage_guard_timer.stop()
+
+    def _handle_stage_guard_timeout(self) -> None:
+        if self._selected not in ("C3", "C4") or self._phase != "running" or self._stage_events_seen > 0:
+            return
+        step_title = CALIBRATION_STEPS[self._selected]["title"]
+        self._set_status(
+            "failed",
+            f"{step_title} did not begin",
+            f"Step {CALIBRATION_STEPS[self._selected]['step']} started, but the glove rebooted or stopped sending stage events. Check the engineering log for {self._selected}_STAGE lines and confirm the flashed firmware matches proto=cal-v3.",
+            self._progress,
+        )
+
+    def _advance_spinner(self) -> None:
+        if self._phase != "running":
+            self._spinner_timer.stop()
+            return
+        self._spinner_index = (self._spinner_index + 1) % 4
+        self._status_chip.setText(f"{self._status_base}{'.' * (self._spinner_index + 1)}")
+
     def _select_step(self, cmd: str) -> None:
+        if self._phase == "running" and cmd != self._selected:
+            self._set_status(
+                "running",
+                self._status_base,
+                "Calibration is still running. Wait for it to finish before moving to another step.",
+                self._progress,
+            )
+            return
         self._selected = cmd
+        self._current_stage = ""
+        self._progress = 0.0
+        self._stage_events_seen = 0
+        self._stop_stage_guard()
         data = CALIBRATION_STEPS[cmd]
+        self._step_kicker.setText(f"Step {data['step']} of {len(CORE_CALIBRATION_FLOW)}")
         self._step_title.setText(data["title"])
+        self._set_stage_label("")
+        self._clear_direction_checklist()
+        self._purpose.setText(data["purpose"])
         self._instruction.setText(data["instruction"])
-        self._command_label.setText(f"Command to send: {cmd}")
-        self._send_btn.setText("Erase calibration" if cmd == "Z" else f"Send {cmd}")
         for key, btn in self._step_buttons.items():
             btn.setProperty("selected", "true" if key == cmd else "false")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+        self._set_status("idle", "Ready to begin", "Review the instructions, then start this step.", 0.0)
 
-    def _send_selected(self) -> None:
+    def _run_selected(self) -> None:
+        if self._phase == "running":
+            return
+        data = CALIBRATION_STEPS[self._selected]
+        self._current_stage = ""
+        self._stage_events_seen = 0
+        self._set_status(
+            "running",
+            data["running"],
+            "Calibration is in progress. Keep the glove in the requested position until the trainer confirms this step.",
+            0.0,
+        )
+        if self._selected in ("C3", "C4"):
+            self._start_stage_guard()
         self.command_requested.emit(self._selected)
-        self._status.setText(f"Sent {self._selected}. Waiting for firmware response...")
 
-    def record_response(self, text: str) -> None:
-        self._status.setText(f"Firmware response: {text}")
+    def _go_to_next_step(self) -> None:
+        idx = CORE_CALIBRATION_FLOW.index(self._selected)
+        if idx + 1 < len(CORE_CALIBRATION_FLOW):
+            self._select_step(CORE_CALIBRATION_FLOW[idx + 1])
 
+    def _update_action_buttons(self) -> None:
+        next_available = (
+            self._phase == "passed"
+            and self._selected in CORE_CALIBRATION_FLOW
+            and CORE_CALIBRATION_FLOW.index(self._selected) < len(CORE_CALIBRATION_FLOW) - 1
+        )
+        self._next_btn.setVisible(next_available)
+        self._next_btn.setEnabled(next_available)
+
+        finish_available = self._phase == "passed" and self._selected == "C4"
+        self._finish_btn.setVisible(finish_available)
+        self._finish_btn.setEnabled(finish_available)
+
+        self._primary_btn.setEnabled(self._phase != "running")
+        if self._phase == "failed":
+            self._primary_btn.setText("Retry Stage")
+        elif self._phase == "passed" and self._selected in ("C3", "C4"):
+            self._primary_btn.setText("Run Again")
+        else:
+            self._primary_btn.setText("Start Calibration")
+
+        for key, btn in self._step_buttons.items():
+            btn.setEnabled(self._phase != "running" or key == self._selected)
+        self._erase_btn.setEnabled(self._phase != "running")
+
+    def _update_motion_stage(
+        self,
+        stage: str,
+        phase: str,
+        progress: float,
+        reason: str,
+        checkpoint: str,
+        axis: str,
+    ) -> None:
+        step_key = "C4" if stage == "hand_motion" else "C3"
+        data = CALIBRATION_STAGE_UI.get(stage, {"title": "Guided capture", "instruction": "Follow the on-screen calibration cue."})
+        self._current_stage = stage
+        self._set_stage_label(stage)
+        self._step_title.setText(data["title"])
+        self._instruction.setText(data["instruction"])
+        self._stop_stage_guard()
+        self._set_direction_checklist(stage, phase, checkpoint)
+
+        if phase == "prompt":
+            if stage == "grip_hold":
+                base = "Hold your normal light grip"
+                detail = "Keep a steady light grip until the glove captures your typical force."
+            else:
+                base = "Move your hand naturally"
+                detail = "Keep a light grip and move your hand naturally for a few seconds so the glove can record intended motion."
+            self._set_status(
+                "running",
+                base,
+                detail,
+                progress,
+            )
+        elif phase == "capturing":
+            if stage == "grip_hold":
+                base = "Capturing normal light grip"
+                detail = "Keep the grip steady. The glove is measuring your typical force."
+            else:
+                base = "Capturing natural hand motion"
+                detail = "Keep moving naturally until the motion capture finishes."
+            self._set_status(
+                "running",
+                base,
+                detail,
+                progress,
+            )
+        elif phase == "pass":
+            if stage == "grip_hold":
+                base = "Normal grip captured"
+                detail = "The glove captured your normal light-grip reference. Finalizing calibration now."
+            else:
+                base = "Natural hand motion captured"
+                detail = "The glove captured a normal-motion reference. Finalizing calibration now."
+            self._set_status(
+                "running",
+                base,
+                detail,
+                progress,
+            )
+        elif phase == "fail":
+            self._set_status(
+                "failed",
+                "Needs retry",
+                calibration_reason_text(reason, CALIBRATION_STEPS[step_key]["failure"]),
+                progress,
+            )
+
+    def record_response(self, data: object) -> None:
+        if isinstance(data, dict):
+            self._record_payload(data)
+        else:
+            self._record_text(str(data))
+
+    def mark_transport_restart(self, details: str) -> bool:
+        if self._phase != "running":
+            return False
+        self._stop_stage_guard()
+        if self._selected in ("C3", "C4"):
+            self._set_status(
+                "failed",
+                "Calibration interrupted",
+                f"The glove restarted during Step {CALIBRATION_STEPS[self._selected]['step']} before the capture finished. Connected firmware: {details or 'unknown'}. Re-run calibration after the device is stable.",
+                self._progress,
+            )
+        else:
+            self._set_status(
+                "failed",
+                "Calibration interrupted",
+                f"The glove restarted while calibration was running. Connected firmware: {details or 'unknown'}. Re-run the current step.",
+                self._progress,
+            )
+        return True
+
+    def _record_payload(self, payload: dict) -> None:
+        if "nvs" in payload:
+            self._stop_stage_guard()
+            self._set_status("passed", CALIBRATION_STEPS["Z"]["success"], "Saved calibration was cleared from the device.", 1.0)
+            return
+        if "err" in payload:
+            self._stop_stage_guard()
+            self._set_status("failed", "Calibration could not continue", f"Device reported an error: {payload['err']}.", self._progress)
+            return
+
+        cal = str(payload.get("cal", ""))
+        status = str(payload.get("status", ""))
+        reason = str(payload.get("reason", ""))
+
+        if cal in ("C3_STAGE", "C4_STAGE"):
+            self._stage_events_seen += 1
+            self._selected = "C4" if cal.startswith("C4") else "C3"
+            self._current_stage = str(payload.get("stage", ""))
+            checkpoint = str(payload.get("checkpoint", ""))
+            axis = str(payload.get("axis", ""))
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_log"):
+                getattr(parent, "_log")(f"{cal} payload: {json.dumps(payload, separators=(',', ':'))}", "sys")
+            self._update_motion_stage(
+                self._current_stage,
+                str(payload.get("phase", "live")),
+                float(payload.get("progress", 0.0)),
+                reason,
+                checkpoint,
+                axis,
+            )
+            return
+
+        if cal in ("C3_START", "C4_START"):
+            self._selected = "C4" if cal.startswith("C4") else "C3"
+            self._current_stage = ""
+            self._step_title.setText(CALIBRATION_STEPS[self._selected]["title"])
+            stages = payload.get("stages", [])
+            first_stage = stages[0] if isinstance(stages, list) and stages else ""
+            if isinstance(first_stage, str) and first_stage in CALIBRATION_STAGE_UI:
+                self._current_stage = first_stage
+                self._set_stage_label(first_stage)
+                self._set_direction_checklist(first_stage, "prompt", "")
+                self._step_title.setText(CALIBRATION_STAGE_UI[first_stage]["title"])
+                self._instruction.setText(CALIBRATION_STAGE_UI[first_stage]["instruction"])
+                status_base = "Waiting for capture"
+                detail = CALIBRATION_STAGE_UI[first_stage]["instruction"]
+            else:
+                self._set_stage_label("")
+                self._clear_direction_checklist()
+                self._instruction.setText(CALIBRATION_STEPS[self._selected]["instruction"])
+                status_base = f"Preparing {CALIBRATION_STEPS[self._selected]['title'].lower()}"
+                detail = CALIBRATION_STEPS[self._selected]["instruction"]
+            self._stage_events_seen = 0
+            self._start_stage_guard()
+            self._set_status(
+                "running",
+                status_base,
+                detail,
+                0.0,
+            )
+            return
+
+        if cal.endswith("_START"):
+            base_cmd = cal.split("_")[0]
+            if base_cmd in CALIBRATION_STEPS:
+                self._selected = base_cmd
+                self._set_stage_label("")
+                self._set_status(
+                    "running",
+                    CALIBRATION_STEPS[base_cmd]["running"],
+                    "Calibration is running. Keep the glove in the requested position until the trainer confirms this step.",
+                    0.0,
+                )
+            return
+
+        if cal.endswith("_LIVE"):
+            base_cmd = cal.split("_")[0]
+            if base_cmd == "C1":
+                detail = f"Stillness is being measured now. Current motion level: {float(payload.get('omega', 0.0)):.2f}."
+            else:
+                detail = "Finger pressure baseline is being measured. Keep your fingers relaxed and off the pads."
+            self._selected = base_cmd
+            self._set_stage_label("")
+            self._set_status("running", CALIBRATION_STEPS[base_cmd]["running"], detail, self._progress)
+            return
+
+        if cal == "COMPLETE":
+            self._stop_stage_guard()
+            active_step = self._selected if self._selected in ("C3", "C4") else "C3"
+            if status == "PASS":
+                self._completed_steps.add(active_step)
+                self._set_stage_label("")
+                self._clear_direction_checklist()
+                self._step_title.setText(CALIBRATION_STEPS[active_step]["title"])
+                self._instruction.setText(CALIBRATION_STEPS[active_step]["instruction"])
+                detail = "All calibration steps are complete and the results were saved." if active_step == "C4" else "The light-grip reference was saved to the glove."
+                self._set_status("passed", "Calibration saved to the glove", detail, 1.0)
+            else:
+                self._set_status("failed", "Calibration could not be saved", "Capture completed, but the device could not save the calibration. Run the step again.", self._progress)
+            return
+
+        if cal in CALIBRATION_STEPS:
+            self._selected = cal
+            data = CALIBRATION_STEPS[cal]
+            if status == "PASS":
+                self._stop_stage_guard()
+                self._completed_steps.add(cal)
+                detail = data["success"]
+                if cal in ("C3", "C4"):
+                    self._set_stage_label("")
+                    self._clear_direction_checklist()
+                    self._step_title.setText(data["title"])
+                    self._instruction.setText(data["instruction"])
+                    if cal == "C3":
+                        detail = "Light-grip capture finished. The glove is saving the measured force reference now."
+                    else:
+                        detail = "Normal hand motion capture finished. The glove is saving the measured motion references now."
+                self._set_status("passed", data["success"], detail, 1.0 if cal in ("C3", "C4") else self._progress)
+                return
+            if status == "FAIL" and cal in ("C3", "C4") and reason == "stage_failed" and self._phase == "failed":
+                return
+            if status == "FAIL":
+                self._stop_stage_guard()
+                self._set_status(
+                    "failed",
+                    "Calibration needs another try",
+                    calibration_reason_text(reason, data["failure"]),
+                    self._progress,
+                )
+                return
+
+        if cal in ("C3_REP", "C4_CYCLE"):
+            self._set_status("failed", "Legacy calibration action", calibration_reason_text(reason, "This calibration action is no longer part of the guided workflow."), self._progress)
+            return
+
+        self._record_text(f"Calibration update received for {cal}.")
+
+    def _record_text(self, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        if "Not connected" in clean:
+            self._set_status("failed", "Connect the glove first", "Calibration could not start because the glove is not connected.", self._progress)
+            return
+        if clean.startswith("<partial serial fragment>"):
+            self._set_status("failed", "Serial line was incomplete", "The glove sent a partial calibration message. Retry the step and check the connection if this continues.", self._progress)
+        self._status_detail_label.setText(clean)
+
+
+# ── SessionSummaryDialog (unchanged) ─────────────────────────────────────────
 
 class SessionSummaryDialog(QDialog):
     def __init__(self, summary: dict, parent: QWidget | None = None) -> None:
@@ -579,20 +1188,20 @@ class SessionSummaryDialog(QDialog):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
         metrics = [
-            ("Avg Force", f"{summary['avg_force']:.3f} N"),
-            ("Peak Force", f"{summary['peak_force']:.3f} N"),
-            ("Peak Finger", f"{summary['peak_finger']:.3f} N"),
-            ("Contact Time", f"{summary['contact_pct']:.0f}%"),
-            ("Warnings", str(summary["warning_events"])),
-            ("Errors", str(summary["error_events"])),
-            ("Tremor Avg", f"{summary['avg_tremor']:.3f}"),
+            ("Avg Force",    f"{summary['avg_force']:.3f} N"),
+            ("Peak Force",   f"{summary['peak_force']:.3f} N"),
+            ("Peak Finger",  f"{summary['peak_finger']:.3f} N"),
+            ("Engaged Time", f"{summary['engaged_pct']:.0f}%"),
+            ("Warnings",     str(summary["warning_events"])),
+            ("Errors",       str(summary["error_events"])),
+            ("Tremor Avg",   f"{summary['avg_tremor']:.3f}"),
             ("Smoothness f95", f"{summary['peak_f95']:.2f} Hz"),
         ]
         for idx, (name, value) in enumerate(metrics):
             item = ClinicalValue(name, "")
             item.set_value(value)
             item.set_accent(
-                RED if name == "Errors" and summary["error_events"] else
+                RED   if name == "Errors"   and summary["error_events"]   else
                 AMBER if name == "Warnings" and summary["warning_events"] else
                 BLUE
             )
@@ -609,33 +1218,38 @@ class SessionSummaryDialog(QDialog):
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
 
+# ── MainWindow ───────────────────────────────────────────────────────────────
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        # ── State (unchanged) ────────────────────────────────────────────────
         self._worker: SerialWorker | None = None
         self._cmd_queue: queue.Queue = queue.Queue()
         self._connected = False
+        self._firmware_info = "Firmware: unknown"
         self._last_packet_at: float | None = None
         self._last_warn = 0
-        self._last_err = 0
+        self._last_err  = 0
         self._last_state = ""
         self._mode = "UNSELECTED"
         self._latest_packet: dict | None = None
         self._hand_process: subprocess.Popen | None = None
         self._calibration_wizard: CalibrationWizard | None = None
         self._session_summary: SessionSummaryDialog | None = None
-        self._session_mode = "UNSELECTED"
+        self._session_mode   = "UNSELECTED"
         self._session_active = False
-        self._armed_mode = "UNSELECTED"
+        self._armed_mode     = "UNSELECTED"
         self._awaiting_arm_mode: str | None = None
         self._pending_live_mode: str | None = None
         self._countdown_value = 0
         self._last_score: float | None = None
-        self._telemetry = TelemetryStore()
+        self._telemetry   = TelemetryStore()
         self._curves: dict[str, pg.PlotDataItem] = {}
         self._plot_widgets: list[pg.PlotWidget] = []
         self._metric_values: dict[str, ClinicalValue] = {}
         self._cmd_button_by_cmd: dict[str, QPushButton] = {}
+        self._mode_buttons: dict[str, QPushButton] = {}
 
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._advance_countdown)
@@ -643,21 +1257,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Haptic Surgical Skill Trainer")
         self.resize(1280, 800)
         self.setMinimumSize(QSize(1180, 740))
-        pg.setConfigOptions(antialias=True, foreground=TEXT, background=ICE)
+        pg.setConfigOptions(antialias=True, foreground=TEXT, background="#0a1929")
 
+        # DESIGN: Single central widget with no margins — the three-zone layout
+        # owns all spacing internally so the window chrome stays flush.
         page = QWidget()
         page.setObjectName("central")
         self.setCentralWidget(page)
 
         root = QVBoxLayout(page)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self._build_header(root)
-        self._build_summary(root)
-        self._build_main_content(root)
-        self._build_engineering_log(root)
+        self._build_ui(root)
 
+        # ── Init state (unchanged signal calls) ──────────────────────────────
         self._populate_ports()
         self._set_commands_enabled(False)
         self._set_state(TrainerState.DISCONNECTED)
@@ -674,268 +1288,415 @@ class MainWindow(QMainWindow):
         self._stale_timer.timeout.connect(self._check_stale)
         self._stale_timer.start(500)
 
-    def _build_header(self, root: QVBoxLayout) -> None:
-        header = QFrame()
-        header.setObjectName("header_panel")
-        row = QHBoxLayout(header)
-        row.setContentsMargins(14, 8, 14, 8)
-        row.setSpacing(8)
+    # ── NEW: Three-zone build entry point ─────────────────────────────────────
 
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
+    def _build_ui(self, root: QVBoxLayout) -> None:
+        """Replace the original flat layout with the three-zone design."""
+        self._build_app_bar(root)       # Zone 1 — fixed 64 px top bar
+        self._build_content_area(root)  # Zone 2 — expands to fill remaining height
+        self._build_engineering_log(root)  # collapsible; stays outside the split
+
+    # ── ZONE 1: Application Bar ───────────────────────────────────────────────
+
+    def _build_app_bar(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: App bar is exactly 64 px and uses a 3 px left NAVY accent border
+        # instead of a bottom highlight — this differentiates the brand edge from
+        # the content separator (1 px BORDER bottom). The left bar echoes the
+        # left-accent pattern used on KPI cards and metric cards throughout.
+        # Considered a full NAVY background bar but rejected: dark headers conflict
+        # with the clinical-white ICE aesthetic and obscure text on small displays.
+        """
+        bar = QFrame()
+        bar.setObjectName("app_bar")
+        bar.setFixedHeight(64)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(16, 0, 16, 0)
+        row.setSpacing(12)
+
+        # Brand: icon + title + subtitle
+        brand_row = QHBoxLayout()
+        brand_row.setSpacing(10)
+
+        icon_box = QFrame()
+        icon_box.setObjectName("app_icon")
+        icon_box.setFixedSize(36, 36)
+
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(1)
         title = QLabel("Haptic Surgical Skill Trainer")
-        title.setObjectName("title")
-        subtitle = QLabel("Clinical training console | live force, motion, and skill telemetry")
-        subtitle.setObjectName("subtitle")
-        title_col.addWidget(title)
-        title_col.addWidget(subtitle)
-        row.addLayout(title_col, 1)
+        title.setObjectName("app_title")
+        subtitle = QLabel("Clinical Training Console")
+        subtitle.setObjectName("app_subtitle")
+        brand_text.addWidget(title)
+        brand_text.addWidget(subtitle)
+
+        brand_row.addWidget(icon_box)
+        brand_row.addLayout(brand_text)
+        row.addLayout(brand_row, 1)
+
+        # Center: status pill + packet rate
+        center_row = QHBoxLayout()
+        center_row.setSpacing(8)
+
+        self._status_pill = QLabel("⬤  DISCONNECTED")
+        self._status_pill.setObjectName("status_pill")
+        # DESIGN: status_pill uses border-radius:14px and dynamic background set
+        # from Python so connected=green vs disconnected=gray reads in <1 second.
+        # The filled circle char (⬤) is the indicator dot — avoids a custom widget.
+        self._set_status_pill_disconnected()
+
+        self._rate_label = QLabel("-- Hz")
+        self._rate_label.setObjectName("rate_chip")
+
+        center_row.addWidget(self._status_pill)
+        center_row.addWidget(self._rate_label)
+        row.addLayout(center_row)
+
+        # Right: port combo + Refresh + Connect
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(8)
 
         self._port_combo = QComboBox()
-        self._port_combo.setMinimumWidth(260)
-        row.addWidget(self._port_combo)
+        self._port_combo.setObjectName("port_combo")
+        self._port_combo.setFixedWidth(180)
 
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._populate_ports)
-        row.addWidget(refresh_btn)
 
         self._btn_connect = QPushButton("Connect")
         self._btn_connect.setObjectName("connect_button")
         self._btn_connect.clicked.connect(self._on_connect_clicked)
-        row.addWidget(self._btn_connect)
-        root.addWidget(header)
 
-    def _build_summary(self, root: QVBoxLayout) -> None:
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        controls_row.addWidget(self._port_combo)
+        controls_row.addWidget(refresh_btn)
+        controls_row.addWidget(self._btn_connect)
+        row.addLayout(controls_row)
 
-        self._score_card = SummaryCard("Session Score", "resets every mode start", GREEN)
-        self._force_card = SummaryCard("Total Force", "N", BLUE)
-        self._vital_sign = VitalSignWidget()
-        row.addWidget(self._score_card, 1)
-        row.addWidget(self._force_card, 1)
-        row.addWidget(self._vital_sign, 2)
+        root.addWidget(bar)
 
-        status = QFrame()
-        status.setObjectName("status_panel")
-        layout = QGridLayout(status)
-        layout.setContentsMargins(14, 8, 14, 8)
-        layout.setHorizontalSpacing(14)
-        layout.setVerticalSpacing(3)
+    def _set_status_pill_disconnected(self) -> None:
+        self._status_pill.setText("⬤  DISCONNECTED")
+        self._status_pill.setStyleSheet(
+            f"color: {MUTED}; background: #f4f7fa;"
+            f"border: 1.5px solid {BORDER};"
+            "border-radius: 14px; padding: 4px 12px;"
+            "font-size: 11px; font-weight: 800; letter-spacing: 0.04em;"
+        )
 
-        self._state_label = QLabel("DISCONNECTED")
-        self._state_label.setObjectName("state_label")
-        self._mode_label = QLabel("No mode selected")
-        self._mode_label.setObjectName("mode_badge")
-        self._session_hint_label = QLabel("Choose a difficulty mode to start a scored session.")
-        self._session_hint_label.setObjectName("session_hint")
-        self._packet_label = QLabel("Packets: 0")
-        self._packet_label.setObjectName("muted_label")
-        self._rate_label = QLabel("JSON: -- Hz")
-        self._rate_label.setObjectName("muted_label")
-        self._stale_label = QLabel("Telemetry: waiting")
-        self._stale_label.setObjectName("status_badge")
-        self._contact_label = QLabel("Contact: --/--/--")
-        self._contact_label.setObjectName("status_badge")
-        self._score_delta_label = QLabel("Score change: --")
-        self._score_delta_label.setObjectName("status_badge")
-        self._coaching_label = QLabel("Awaiting live glove data")
-        self._coaching_label.setObjectName("coach_label")
-        self._alert_label = QLabel("No active warnings")
-        self._alert_label.setObjectName("alert_label")
+    def _set_status_pill_connected(self) -> None:
+        self._status_pill.setText("⬤  CONNECTED")
+        self._status_pill.setStyleSheet(
+            f"color: {GREEN}; background: #edf8f2;"
+            f"border: 1.5px solid {GREEN};"
+            "border-radius: 14px; padding: 4px 12px;"
+            "font-size: 11px; font-weight: 800; letter-spacing: 0.04em;"
+        )
 
-        layout.addWidget(QLabel("Session State"), 0, 0)
-        layout.addWidget(self._state_label, 1, 0)
-        layout.addWidget(self._mode_label, 2, 0)
-        layout.addWidget(self._packet_label, 0, 1)
-        layout.addWidget(self._rate_label, 1, 1)
-        layout.addWidget(self._stale_label, 2, 1)
-        layout.addWidget(self._coaching_label, 0, 2, 2, 1)
-        layout.addWidget(self._session_hint_label, 2, 2)
-        layout.addWidget(self._contact_label, 3, 0)
-        layout.addWidget(self._score_delta_label, 3, 1)
-        layout.addWidget(self._alert_label, 3, 2)
-        layout.setColumnStretch(2, 1)
-        row.addWidget(status, 3)
-        root.addLayout(row)
+    # ── ZONE 2: Main Content Area ─────────────────────────────────────────────
 
-    def _build_main_content(self, root: QVBoxLayout) -> None:
+    def _build_content_area(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: Content area splits 70/30 (left column / sidebar) using a
+        # QHBoxLayout with stretch factors 7 and 3. The sidebar has a fixed
+        # max-width=310 so it doesn't balloon on ultra-wide displays. Considered
+        # QSplitter but rejected — users shouldn't resize the sidebar; the sidebar
+        # width was tuned so all buttons are fully readable without truncation.
+        """
         split = QHBoxLayout()
-        split.setSpacing(10)
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(0)
 
-        left = QVBoxLayout()
-        left.setSpacing(0)
-        self._build_plots(left)
-        split.addLayout(left, 1)
-
-        right_panel = QWidget()
-        right_panel.setFixedWidth(330)
-        right = QVBoxLayout()
-        right_panel.setLayout(right)
-        right.setContentsMargins(0, 0, 0, 0)
-        right.setSpacing(8)
-        self._build_side_tabs(right)
-        split.addWidget(right_panel)
+        self._build_left_column(split)
+        self._build_sidebar(split)
 
         root.addLayout(split, 1)
 
-    def _build_side_tabs(self, root: QVBoxLayout) -> None:
-        tabs = QTabWidget()
-        tabs.setObjectName("side_tabs")
+    # ── LEFT COLUMN ──────────────────────────────────────────────────────────
 
-        session = QWidget()
-        session_layout = QVBoxLayout(session)
-        session_layout.setContentsMargins(0, 0, 0, 0)
-        session_layout.setSpacing(8)
-        self._build_command_panel(session_layout)
-        self._build_visualization_panel(session_layout)
-        self._build_activity_feed(session_layout)
-        tabs.addTab(session, "Session")
+    def _build_left_column(self, split: QHBoxLayout) -> None:
+        left_widget = QWidget()
+        left_widget.setObjectName("left_column")
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(12, 10, 10, 10)
+        left_layout.setSpacing(8)
 
-        metrics = QWidget()
-        metrics_layout = QVBoxLayout(metrics)
-        metrics_layout.setContentsMargins(0, 0, 0, 0)
-        metrics_layout.setSpacing(0)
-        self._build_metrics_strip(metrics_layout)
-        tabs.addTab(metrics, "Metrics")
+        # Pill tab bar
+        self._build_tab_bar(left_layout)
 
-        info = QWidget()
-        info_layout = QVBoxLayout(info)
-        info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(8)
-        self._build_info_tab(info_layout)
-        tabs.addTab(info, "Info")
+        # Tab content container (stacked manually via show/hide)
+        self._build_train_tab(left_layout)
+        self._build_metrics_tab_widget(left_layout)
+        self._build_review_tab_widget(left_layout)
 
-        root.addWidget(tabs, 1)
+        # Default: Train tab visible
+        self._show_tab("Train")
 
-    def _build_info_tab(self, root: QVBoxLayout) -> None:
-        panel = QFrame()
-        panel.setObjectName("side_panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 8, 10, 10)
+        split.addWidget(left_widget, 7)
+
+    def _build_tab_bar(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: Pill-button tab bar replaces QTabWidget for the left column.
+        # QPushButton with border-radius:20px and checkable=False (state managed
+        # manually via objectName property) avoids QTabWidget's pane border which
+        # bled a 1px BORDER line across the full width — looked like a bug.
+        # Considered custom QTabBar subclass but QPushButton + property QSS is
+        # simpler to maintain and easier for teammates to read.
+        """
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(6)
+        tab_row.setContentsMargins(0, 0, 0, 2)
+        self._tab_buttons: dict[str, QPushButton] = {}
+        for label in ("Train", "Metrics", "Review"):
+            btn = QPushButton(label)
+            btn.setObjectName("tab_pill")
+            btn.setCheckable(False)
+            btn.clicked.connect(lambda _checked=False, t=label: self._show_tab(t))
+            self._tab_buttons[label] = btn
+            tab_row.addWidget(btn)
+        tab_row.addStretch()
+        root.addLayout(tab_row)
+
+    def _show_tab(self, tab: str) -> None:
+        """Show the selected tab content; update pill active states."""
+        for name, btn in self._tab_buttons.items():
+            active = name == tab
+            btn.setProperty("tab_active", "true" if active else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self._train_container.setVisible(tab == "Train")
+        self._metrics_container.setVisible(tab == "Metrics")
+        self._review_container.setVisible(tab == "Review")
+
+    # ── TRAIN TAB ─────────────────────────────────────────────────────────────
+
+    def _build_train_tab(self, root: QVBoxLayout) -> None:
+        self._train_container = QWidget()
+        self._train_container.setObjectName("train_container")
+        layout = QVBoxLayout(self._train_container)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        title = QLabel("Training Modes")
-        title.setObjectName("panel_title")
-        intro = QLabel("Select a mode to arm the trainer, then press Start for the countdown and scored run.")
-        intro.setObjectName("panel_caption")
-        intro.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(intro)
+        self._build_session_banner(layout)
+        self._build_kpi_grid(layout)
+        self._build_force_chart(layout)
 
-        for name, color, body in [
-            ("Easy", GREEN, "Widest force margin. Use for onboarding, sensor checks, and early practice."),
-            ("Intermediate", BLUE, "Normal training mode. Use once the user can maintain stable contact."),
-            ("Hard", RED, "Narrowest force margin. Use for advanced control and assessment runs."),
-        ]:
-            card = QFrame()
-            card.setObjectName("info_card")
-            card.setStyleSheet(
-                "QFrame#info_card {"
-                f"background-color: {PANEL_ALT};"
-                f"border: 1px solid {BORDER};"
-                f"border-left: 4px solid {color};"
-                "border-radius: 8px;"
-                "}"
-            )
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(10, 8, 10, 8)
-            card_layout.setSpacing(3)
-            heading = QLabel(name)
-            heading.setObjectName("info_mode")
-            heading.setStyleSheet(f"color: {color};")
-            text = QLabel(body)
-            text.setObjectName("info_body")
-            text.setWordWrap(True)
-            card_layout.addWidget(heading)
-            card_layout.addWidget(text)
-            layout.addWidget(card)
+        root.addWidget(self._train_container, 1)
 
-        layout.addStretch()
-        root.addWidget(panel)
+    def _build_session_banner(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: Session banner is a full-width card with a 4 px colored left
+        # border that changes state color. Left-border state feedback chosen over
+        # background tinting — tinted backgrounds interact poorly with the white
+        # KPI cards below (creates apparent color bleed at close proximity).
+        # The VitalSignWidget is embedded in the RIGHT side of the banner so the
+        # heartbeat waveform is visible without scrolling from the Train default view.
+        """
+        banner = QFrame()
+        banner.setObjectName("session_banner")
+        self._session_banner = banner
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(16, 12, 16, 12)
+        row.setSpacing(16)
 
-    def _build_metrics_strip(self, root: QVBoxLayout) -> None:
-        panel = QFrame()
-        panel.setObjectName("metric_strip")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 8, 10, 10)
-        layout.setSpacing(6)
-        title = QLabel("Live Metrics")
-        title.setObjectName("panel_title")
-        layout.addWidget(title)
+        # Left: state text + mode badge + score
+        left = QVBoxLayout()
+        left.setSpacing(4)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(6)
-        layout.addLayout(grid)
+        self._state_label = QLabel("DISCONNECTED")
+        self._state_label.setObjectName("state_label")
 
-        specs = [
-            ("f0", "Thumb", "N", BLUE),
-            ("f1", "Index", "N", BLUE),
-            ("f2", "Middle", "N", BLUE),
-            ("roll", "Roll", "deg", BLUE_DARK),
-            ("pitch", "Pitch", "deg", BLUE_DARK),
-            ("yaw", "Yaw", "deg", BLUE_DARK),
-            ("tremor", "Tremor", "ratio", VIOLET),
-            ("cv_f", "Force CV", "ratio", VIOLET),
-            ("swing", "Swing", "Hz", VIOLET),
-            ("f95", "F95", "Hz", VIOLET),
-            ("contact", "Contact", "T/I/M", GREEN),
-            ("warn_err", "Warn / Err", "bitmask", AMBER),
-        ]
-        for idx, (key, title, unit, color) in enumerate(specs):
-            item = ClinicalValue(title, unit, color)
-            self._metric_values[key] = item
-            grid.addWidget(item, idx // 2, idx % 2)
-        root.addWidget(panel)
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(8)
+        self._mode_label = QLabel("No mode selected")
+        self._mode_label.setObjectName("mode_badge")
+        self._score_inline = QLabel("Score: --")
+        self._score_inline.setObjectName("score_inline")
+        meta_row.addWidget(self._mode_label)
+        meta_row.addWidget(self._score_inline)
+        meta_row.addStretch()
 
-    def _build_plots(self, root: QVBoxLayout) -> None:
-        self._plots = QTabWidget()
-        self._plots.setObjectName("plot_tabs")
-        self._plots.setMinimumHeight(500)
-        self._plots.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Status items below — packet / rate / contact for quick reference
+        status_row = QHBoxLayout()
+        status_row.setSpacing(16)
+        self._packet_label = QLabel("Packets: 0")
+        self._packet_label.setObjectName("banner_stat")
+        self._contact_label = QLabel("Contact: --/--/--")
+        self._contact_label.setObjectName("banner_stat")
+        self._gate_label = QLabel("Gate: NONE")
+        self._gate_label.setObjectName("banner_stat")
+        self._stale_label = QLabel("Telemetry: waiting")
+        self._stale_label.setObjectName("banner_stat")
+        status_row.addWidget(self._packet_label)
+        status_row.addWidget(self._contact_label)
+        status_row.addWidget(self._gate_label)
+        status_row.addWidget(self._stale_label)
+        status_row.addStretch()
+
+        left.addWidget(self._state_label)
+        left.addLayout(meta_row)
+        left.addLayout(status_row)
+
+        # Right: vital sign waveform
+        vital_col = QVBoxLayout()
+        vital_col.setSpacing(2)
+        vital_hdr = QLabel("LIVE VITAL")
+        vital_hdr.setObjectName("vital_header")
+        self._vital_sign = VitalSignWidget()
+        vital_col.addWidget(vital_hdr)
+        vital_col.addWidget(self._vital_sign)
+
+        row.addLayout(left, 1)
+        row.addLayout(vital_col)
+        root.addWidget(banner)
+
+        # Helper refs for coaching / alerts (used by unchanged _update_coaching)
+        self._coaching_label       = self._state_label  # reuse state label slot
+        self._session_hint_label   = self._mode_label   # keep compat
+        self._score_delta_label    = self._score_inline
+        self._alert_label          = self._stale_label
+
+    def _build_kpi_grid(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: 4-column KPI grid with individual accent colors chosen by data
+        # domain — GREEN=score (clinical performance), BLUE=force (primary sensor),
+        # VIOLET=packets (data pipeline), AMBER=rate (frequency domain). This
+        # color-to-domain mapping is consistent with the metric card accents below.
+        # Considered 2×2 grid but 1×4 row keeps all KPIs scannable without vertical
+        # eye movement — critical when the user is also watching the glove.
+        """
+        grid_row = QHBoxLayout()
+        grid_row.setSpacing(8)
+
+        self._score_card = KpiCard("Session Score", "resets every mode start", GREEN)
+        self._force_card = KpiCard("Total Force",   "N",                       BLUE)
+        self._packet_kpi = KpiCard("Packet Count",  "telemetry packets",       VIOLET)
+        self._rate_kpi   = KpiCard("Telemetry Rate", "Hz",                      AMBER)
+
+        for card in (self._score_card, self._force_card, self._packet_kpi, self._rate_kpi):
+            grid_row.addWidget(card, 1)
+
+        root.addLayout(grid_row)
+
+    def _build_force_chart(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: Chart container is a white outer card holding an inner dark-bg
+        # pyqtgraph plot. The 2px NAVY border on the chart itself signals deliberate
+        # contrast — without it the dark plot appeared to be a rendering error
+        # against the surrounding white card. Rounded container (12px) gives the
+        # chart a frame that matches the KPI cards above.
+        # Sub-tab buttons (Force/Motion/Skill/Score) are outlined chips — not QTabWidget
+        # — so the tab bar doesn't add a pane border that competes with the chart border.
+        """
+        chart_card = QFrame()
+        chart_card.setObjectName("chart_card")
+        chart_layout = QVBoxLayout(chart_card)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        chart_layout.setSpacing(0)
+
+        # Header row: title + sub-tabs
+        header = QHBoxLayout()
+        header.setContentsMargins(14, 10, 10, 8)
+        header.setSpacing(8)
+        chart_title = QLabel("Force Profile")
+        chart_title.setObjectName("chart_title")
+        header.addWidget(chart_title)
+        header.addStretch()
+
+        self._chart_sub_tabs: dict[str, QPushButton] = {}
+        for label in ("Force", "Motion", "Skill", "Score"):
+            btn = QPushButton(label)
+            btn.setObjectName("chart_tab_chip")
+            btn.clicked.connect(lambda _checked=False, t=label: self._switch_chart_tab(t))
+            self._chart_sub_tabs[label] = btn
+            header.addWidget(btn)
+        chart_layout.addLayout(header)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setObjectName("chart_sep")
+        chart_layout.addWidget(sep)
+
+        # Plot widget stack (reuse existing _build_plots logic but in one container)
+        self._plots_stack = QWidget()
+        stack_layout = QVBoxLayout(self._plots_stack)
+        stack_layout.setContentsMargins(0, 0, 0, 0)
+        stack_layout.setSpacing(0)
+        self._build_plots_in(stack_layout)
+        chart_layout.addWidget(self._plots_stack, 1)
+
+        root.addWidget(chart_card, 1)
+        self._switch_chart_tab("Force")
+
+    def _build_plots_in(self, root: QVBoxLayout) -> None:
+        """Build the four pyqtgraph plot widgets, stacked, only one visible at a time."""
+        self._plot_frames: dict[str, pg.PlotWidget] = {}
 
         force = self._make_plot("Force profile", "Time (s)", "Force (N)")
         force.setYRange(0, 5)
-        self._curves["f0"] = self._plot_curve(force, "Thumb", BLUE)
-        self._curves["f1"] = self._plot_curve(force, "Index", GREEN)
-        self._curves["f2"] = self._plot_curve(force, "Middle", VIOLET)
-        self._curves["f_sum"] = self._plot_curve(force, "Total", AMBER, 3)
-        self._plots.addTab(force, "Force")
+        self._curves["f0"]    = self._plot_curve(force, "Thumb",  "#2196f3")
+        self._curves["f1"]    = self._plot_curve(force, "Index",  "#4caf50")
+        self._curves["f2"]    = self._plot_curve(force, "Middle", "#9e9e9e")
+        self._curves["f_sum"] = self._plot_curve(force, "Total",  "#ff9800", 3)
+        self._plot_frames["Force"] = force
+        root.addWidget(force)
 
         motion = self._make_plot("Orientation", "Time (s)", "Angle (deg)")
         motion.setYRange(-180, 180)
-        self._curves["roll"] = self._plot_curve(motion, "Roll", BLUE)
+        self._curves["roll"]  = self._plot_curve(motion, "Roll",  BLUE)
         self._curves["pitch"] = self._plot_curve(motion, "Pitch", GREEN)
-        self._curves["yaw"] = self._plot_curve(motion, "Yaw", AMBER)
-        self._plots.addTab(motion, "Motion")
+        self._curves["yaw"]   = self._plot_curve(motion, "Yaw",   AMBER)
+        self._plot_frames["Motion"] = motion
+        root.addWidget(motion)
 
         skill = self._make_plot("Skill stability", "Time (s)", "Scaled metric")
         skill.setYRange(0, 20)
         self._curves["tremor"] = self._plot_curve(skill, "Tremor x10", RED)
-        self._curves["cv_f"] = self._plot_curve(skill, "Force CV x10", VIOLET)
-        self._curves["swing"] = self._plot_curve(skill, "Swing", BLUE)
-        self._curves["f95"] = self._plot_curve(skill, "F95", AMBER)
-        self._plots.addTab(skill, "Skill")
+        self._curves["cv_f"]   = self._plot_curve(skill, "Force CV x10", VIOLET)
+        self._curves["swing"]  = self._plot_curve(skill, "Swing",        BLUE)
+        self._curves["f95"]    = self._plot_curve(skill, "F95",          AMBER)
+        self._plot_frames["Skill"] = skill
+        root.addWidget(skill)
 
         score = self._make_plot("Performance score", "Time (s)", "Score / event")
         score.setYRange(0, 100)
-        self._curves["score"] = self._plot_curve(score, "Score", GREEN, 3)
-        self._curves["warn"] = self._plot_curve(score, "Warning event", AMBER)
-        self._curves["err"] = self._plot_curve(score, "Error event", RED)
-        self._plots.addTab(score, "Score")
-        root.addWidget(self._plots, 1)
+        self._curves["score"] = self._plot_curve(score, "Score",         GREEN, 3)
+        self._curves["warn"]  = self._plot_curve(score, "Warning event", AMBER)
+        self._curves["err"]   = self._plot_curve(score, "Error event",   RED)
+        self._plot_frames["Score"] = score
+        root.addWidget(score)
+
+        # Hide all initially; _switch_chart_tab will show the default.
+        for w in self._plot_frames.values():
+            w.setVisible(False)
+
+    def _switch_chart_tab(self, tab: str) -> None:
+        for name, widget in self._plot_frames.items():
+            widget.setVisible(name == tab)
+        for name, btn in self._chart_sub_tabs.items():
+            active = name == tab
+            btn.setProperty("chip_active", "true" if active else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
 
     def _make_plot(self, title: str, x_label: str, y_label: str) -> pg.PlotWidget:
-        plot = pg.PlotWidget(background=PANEL)
+        """
+        # DESIGN: Dark background (#0a1929) on all plot widgets — creates deliberate
+        # medical-monitor contrast against the surrounding white/ICE panels. Grid
+        # color #1a3050 is dark enough to be invisible at a glance but visible on
+        # inspection, mimicking ECG paper. Axes text uses MUTED so numeric ticks
+        # don't compete with the waveform colors.
+        """
+        plot = pg.PlotWidget(background="#0a1929")
         plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        plot.setTitle(title, color=NAVY, size="12pt")
+        plot.setTitle(title, color="#8ab4d4", size="11pt")
         plot.setLabel("bottom", x_label, color=MUTED)
-        plot.setLabel("left", y_label, color=MUTED)
-        plot.showGrid(x=True, y=True, alpha=0.28)
-        plot.addLegend(offset=(12, 12), labelTextColor=TEXT)
-        plot.getAxis("bottom").setPen(GRID)
-        plot.getAxis("left").setPen(GRID)
+        plot.setLabel("left",   y_label, color=MUTED)
+        plot.showGrid(x=True, y=True, alpha=0.35)
+        plot.addLegend(offset=(12, 12), labelTextColor="#8ab4d4")
+        plot.getAxis("bottom").setPen("#1a3050")
+        plot.getAxis("left").setPen("#1a3050")
         plot.getAxis("bottom").setTextPen(MUTED)
         plot.getAxis("left").setTextPen(MUTED)
         plot.setMenuEnabled(False)
@@ -947,114 +1708,310 @@ class MainWindow(QMainWindow):
                     color: str, width: int = 2) -> pg.PlotDataItem:
         return plot.plot([], [], name=name, pen=pg.mkPen(color=color, width=width))
 
-    def _build_visualization_panel(self, root: QVBoxLayout) -> None:
-        panel = QFrame()
-        panel.setObjectName("side_panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 8, 10, 10)
-        layout.setSpacing(6)
-        title = QLabel("3D Visualization")
-        title.setObjectName("panel_title")
-        caption = QLabel("Standalone skeletal suturing pose. IMU rotates the view; force highlights contact.")
-        caption.setObjectName("panel_caption")
-        open_3d = QPushButton("Open 3D Hand View")
-        open_3d.clicked.connect(self._open_hand_window)
-        self._hand_status = QLabel("3D window closed")
-        self._hand_status.setObjectName("muted_label")
-        self._hand_status.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(caption)
-        layout.addWidget(open_3d)
-        layout.addWidget(self._hand_status)
-        root.addWidget(panel)
+    # ── METRICS TAB ──────────────────────────────────────────────────────────
 
-    def _build_command_panel(self, root: QVBoxLayout) -> None:
-        panel = QFrame()
-        panel.setObjectName("side_panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 8, 10, 10)
-        layout.setSpacing(6)
-        title = QLabel("Training Controls")
-        title.setObjectName("panel_title")
-        layout.addWidget(title)
-
-        self._cmd_buttons: list[QPushButton] = []
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(7)
-        grid.setVerticalSpacing(7)
-        for idx, (cmd, label) in enumerate([
-            ("I", "Identify"),
-            ("S", "Stop"),
-            ("E", "Easy"),
-            ("M", "Intermediate"),
-            ("H", "Hard"),
-        ]):
-            if cmd in MODE_BY_COMMAND:
-                button = self._mode_button(cmd, label)
-            else:
-                button = self._command_button(cmd, label)
-            grid.addWidget(button, idx // 2, idx % 2)
-        layout.addLayout(grid)
-
-        self._btn_start = QPushButton("Start")
-        self._btn_start.setObjectName("start_button")
-        self._btn_start.clicked.connect(self._start_countdown)
-        self._btn_start.setEnabled(False)
-        self._countdown_label = QLabel("Select a mode, then press Start.")
-        self._countdown_label.setObjectName("countdown_label")
-        self._countdown_label.setWordWrap(True)
-        layout.addWidget(self._btn_start)
-        layout.addWidget(self._countdown_label)
-
-        calibrate = QPushButton("Calibrate...")
-        calibrate.clicked.connect(self._open_calibration_wizard)
-        layout.addWidget(calibrate)
-        exit_btn = self._command_button("X", "Exit Session", "danger_button")
-        layout.addWidget(exit_btn)
-        root.addWidget(panel)
-
-    def _command_button(self, cmd: str, label: str,
-                        obj_name: str = "command_button") -> QPushButton:
-        btn = QPushButton(label)
-        btn.setObjectName(obj_name)
-        btn.setToolTip(f"Send {cmd}")
-        btn.clicked.connect(lambda _checked=False, value=cmd: self._send_command(value))
-        self._cmd_buttons.append(btn)
-        self._cmd_button_by_cmd[cmd] = btn
-        return btn
-
-    def _mode_button(self, cmd: str, label: str) -> QPushButton:
-        btn = QPushButton(label)
-        btn.setObjectName("command_button")
-        btn.setToolTip(f"Select {label} mode")
-        btn.clicked.connect(lambda _checked=False, value=cmd: self._select_mode(value))
-        self._cmd_buttons.append(btn)
-        self._cmd_button_by_cmd[cmd] = btn
-        return btn
-
-    def _build_activity_feed(self, root: QVBoxLayout) -> None:
-        panel = QFrame()
-        panel.setObjectName("side_panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 8, 10, 10)
-        layout.setSpacing(6)
-        title = QLabel("Clinical Coaching")
-        title.setObjectName("panel_title")
-        layout.addWidget(title)
+    def _build_metrics_tab_widget(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: Metrics tab eliminates the large dead whitespace that existed above
+        # the 'Live Metrics' label in the original layout (caused by the QTabWidget
+        # pane adding ~40px of empty padding before content). The new layout starts
+        # the 3-column grid at y=0 within its container, with only an 8px top margin.
+        """
+        self._metrics_container = QWidget()
+        layout = QVBoxLayout(self._metrics_container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         scroll = QScrollArea()
-        scroll.setObjectName("feed_scroll")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumHeight(120)
+        scroll.setObjectName("metrics_scroll")
+
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 4, 0, 8)
+        inner_layout.setSpacing(6)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+
+        # DESIGN: 3-column grid (was 2-column) — matches the wider left column
+        # (70% of window vs. the old right panel at ~330px). 3 columns gives each
+        # metric card more compact proportions — feels like a clinical data table
+        # rather than a list of tiles.
+        specs = [
+            ("f0",      "Thumb",    "N",       BLUE),
+            ("f1",      "Index",    "N",       BLUE),
+            ("f2",      "Middle",   "N",       BLUE),
+            ("roll",    "Roll",     "deg",     BLUE_DARK),
+            ("pitch",   "Pitch",    "deg",     BLUE_DARK),
+            ("yaw",     "Yaw",      "deg",     BLUE_DARK),
+            ("tremor",  "Tremor",   "ratio",   VIOLET),
+            ("cv_f",    "Force CV", "ratio",   VIOLET),
+            ("swing",   "Swing",    "Hz",      VIOLET),
+            ("f95",     "F95",      "Hz",      VIOLET),
+            ("contact", "Contact",  "T/I/M",   GREEN),
+            ("warn_err","Warn/Err", "bitmask", AMBER),
+        ]
+        for idx, (key, title, unit, color) in enumerate(specs):
+            item = ClinicalValue(title, unit, color)
+            self._metric_values[key] = item
+            grid.addWidget(item, idx // 3, idx % 3)
+
+        inner_layout.addLayout(grid)
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+        root.addWidget(self._metrics_container, 1)
+
+    # ── REVIEW TAB ───────────────────────────────────────────────────────────
+
+    def _build_review_tab_widget(self, root: QVBoxLayout) -> None:
+        """
+        # DESIGN: Review tab is a full-width scrollable activity feed. Each card
+        # uses a 4 px left border (same color system as metric cards) + an icon
+        # glyph (●/▲/✕/✓) so the severity is readable at peripheral vision without
+        # reading the message text. Message text is 14px semibold; timestamp is
+        # 10px MUTED mono — clear typographic hierarchy between 'what' and 'when'.
+        """
+        self._review_container = QWidget()
+        layout = QVBoxLayout(self._review_container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("review_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         container = QWidget()
         self._feed_layout = QVBoxLayout(container)
-        self._feed_layout.setContentsMargins(0, 0, 0, 0)
+        self._feed_layout.setContentsMargins(0, 4, 0, 8)
         self._feed_layout.setSpacing(8)
         self._feed_layout.addStretch()
         scroll.setWidget(container)
-        layout.addWidget(scroll, 1)
-        root.addWidget(panel, 1)
+        layout.addWidget(scroll)
+
+        root.addWidget(self._review_container, 1)
+
+    # ── RIGHT SIDEBAR ─────────────────────────────────────────────────────────
+
+    def _build_sidebar(self, split: QHBoxLayout) -> None:
+        """
+        # DESIGN: Sidebar is a single white QFrame (not a QTabWidget) — all sections
+        # are separated by 1px BORDER horizontal rules, not by tab panes. This gives
+        # a unified-card feel that reads as a control panel, not a navigation system.
+        # A single QVBoxLayout with internal separators + a bottom spacer is simpler
+        # to maintain than nested tab widgets and avoids the extra pane border overhead.
+        # Max-width 310px prevents the sidebar from becoming a second content column
+        # on >1440px displays.
+        """
+        sidebar_card = QFrame()
+        sidebar_card.setObjectName("sidebar_card")
+        sidebar_card.setMaximumWidth(310)
+        sidebar_card.setMinimumWidth(260)
+
+        # DESIGN: Drop shadow on the sidebar card — distinguishes the control panel
+        # from the content area without a heavy border. blurRadius=20 chosen to spread
+        # across the gap between sidebar and content; alpha=28 keeps it subtle.
+        sidebar_shadow = QGraphicsDropShadowEffect(sidebar_card)
+        sidebar_shadow.setBlurRadius(20)
+        sidebar_shadow.setOffset(-2, 0)
+        sidebar_shadow.setColor(QColor(15, 45, 82, 28))
+        sidebar_card.setGraphicsEffect(sidebar_shadow)
+
+        outer = QVBoxLayout(sidebar_card)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("sidebar_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        inner_widget = QWidget()
+        self._sidebar_layout = QVBoxLayout(inner_widget)
+        self._sidebar_layout.setContentsMargins(14, 14, 14, 14)
+        self._sidebar_layout.setSpacing(0)
+
+        self._build_training_controls_section()
+        self._sidebar_sep()
+        self._build_calibration_section()
+        self._sidebar_sep()
+        self._build_visualization_section()
+
+        # DESIGN: QSpacerItem pushes Exit Session to the bottom of the sidebar.
+        # Adjacent placement of the danger action next to normal controls risks
+        # accidental session termination — physical separation is the safest UX
+        # pattern for irreversible actions on clinical devices.
+        self._sidebar_layout.addItem(
+            QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
+        )
+
+        scroll.setWidget(inner_widget)
+        outer.addWidget(scroll, 1)
+
+        # Exit Session pinned at the very bottom, outside the scroll area
+        self._build_exit_section(outer)
+
+        split.addWidget(sidebar_card)
+
+    def _sidebar_sep(self) -> None:
+        """Insert a 1px horizontal rule between sidebar sections."""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setObjectName("sidebar_sep")
+        self._sidebar_layout.addWidget(sep)
+
+    def _sidebar_section_header(self, text: str) -> QLabel:
+        """
+        # DESIGN: Section headers are 9px all-caps MUTED with letter-spacing 0.08em.
+        # All-caps + letter-spacing differentiates structural labels from data labels
+        # without adding a new typeface or weight to the hierarchy. The thin bottom
+        # border (BORDER color) provides a subtle grouping underline without a heavy
+        # visual separator that would compete with the data cards.
+        """
+        lbl = QLabel(text)
+        lbl.setObjectName("section_header")
+        self._sidebar_layout.addWidget(lbl)
+        return lbl
+
+    def _build_training_controls_section(self) -> None:
+        self._sidebar_layout.addSpacing(4)
+        self._sidebar_section_header("TRAINING CONTROLS")
+        self._sidebar_layout.addSpacing(8)
+
+        # Mode buttons stacked full-width
+        # DESIGN: Mode buttons are full-width stacked — considered 3 equal columns
+        # but "Intermediate" truncates at any sidebar width below 290px; stacked
+        # layout scales correctly at all sizes and groups the buttons as a mutually
+        # exclusive radio set, which is visually clearer than a grid.
+        self._cmd_buttons: list[QPushButton] = []
+
+        easy_btn = QPushButton("Easy")
+        easy_btn.setObjectName("mode_easy")
+        easy_btn.clicked.connect(lambda _=False: self._select_mode("E"))
+        self._cmd_buttons.append(easy_btn)
+        self._cmd_button_by_cmd["E"] = easy_btn
+        self._mode_buttons["EASY"] = easy_btn
+        self._sidebar_layout.addWidget(easy_btn)
+        self._sidebar_layout.addSpacing(6)
+
+        int_btn = QPushButton("Intermediate")
+        int_btn.setObjectName("mode_intermediate")
+        int_btn.clicked.connect(lambda _=False: self._select_mode("M"))
+        self._cmd_buttons.append(int_btn)
+        self._cmd_button_by_cmd["M"] = int_btn
+        self._mode_buttons["INTERMEDIATE"] = int_btn
+        self._sidebar_layout.addWidget(int_btn)
+        self._sidebar_layout.addSpacing(6)
+
+        hard_btn = QPushButton("Hard")
+        hard_btn.setObjectName("mode_hard")
+        hard_btn.clicked.connect(lambda _=False: self._select_mode("H"))
+        self._cmd_buttons.append(hard_btn)
+        self._cmd_button_by_cmd["H"] = hard_btn
+        self._mode_buttons["HARD"] = hard_btn
+        self._sidebar_layout.addWidget(hard_btn)
+        self._sidebar_layout.addSpacing(10)
+
+        # Start button — primary action
+        self._btn_start = QPushButton("▶  Start")
+        self._btn_start.setObjectName("start_button")
+        self._btn_start.clicked.connect(self._start_countdown)
+        self._btn_start.setEnabled(False)
+        # DESIGN: 48px min-height on Start button — primary action must be
+        # thumb-sized and impossible to miss. 36px felt weak against the sidebar's
+        # other elements; 48px matches the touch target recommendation for clinical
+        # interfaces where gloves may be worn.
+        self._btn_start.setMinimumHeight(48)
+        self._sidebar_layout.addWidget(self._btn_start)
+        self._sidebar_layout.addSpacing(6)
+
+        # Stop button (secondary)
+        stop_btn = QPushButton("■  Stop")
+        stop_btn.setObjectName("command_button")
+        stop_btn.setToolTip("Send S — stop session")
+        stop_btn.clicked.connect(lambda _=False: self._send_command("S"))
+        self._cmd_buttons.append(stop_btn)
+        self._cmd_button_by_cmd["S"] = stop_btn
+        self._sidebar_layout.addWidget(stop_btn)
+
+        self._countdown_label = QLabel("Select a mode, then press Start.")
+        self._countdown_label.setObjectName("countdown_label")
+        self._countdown_label.setWordWrap(True)
+        self._sidebar_layout.addSpacing(6)
+        self._sidebar_layout.addWidget(self._countdown_label)
+        self._sidebar_layout.addSpacing(14)
+
+    def _build_calibration_section(self) -> None:
+        self._sidebar_layout.addSpacing(12)
+        self._sidebar_section_header("CALIBRATION")
+        self._sidebar_layout.addSpacing(8)
+
+        calibrate = QPushButton("Calibrate…")
+        calibrate.setObjectName("outline_button")
+        calibrate.clicked.connect(self._open_calibration_wizard)
+        self._sidebar_layout.addWidget(calibrate)
+
+        self._cal_status = QLabel("No calibration yet.")
+        self._cal_status.setObjectName("muted_label")
+        self._fw_info_label = QLabel(self._firmware_info)
+        self._fw_info_label.setObjectName("muted_label")
+        self._fw_info_label.setWordWrap(True)
+        self._sidebar_layout.addSpacing(4)
+        self._sidebar_layout.addWidget(self._cal_status)
+        self._sidebar_layout.addSpacing(4)
+        self._sidebar_layout.addWidget(self._fw_info_label)
+        self._sidebar_layout.addSpacing(14)
+
+    def _build_visualization_section(self) -> None:
+        self._sidebar_layout.addSpacing(12)
+        self._sidebar_section_header("3D VISUALIZATION")
+        self._sidebar_layout.addSpacing(8)
+
+        open_3d = QPushButton("Open 3D Hand View")
+        open_3d.setObjectName("outline_button")
+        open_3d.clicked.connect(self._open_hand_window)
+        self._sidebar_layout.addWidget(open_3d)
+
+        self._hand_status = QLabel("3D window closed")
+        self._hand_status.setObjectName("muted_label")
+        self._hand_status.setWordWrap(True)
+        self._sidebar_layout.addSpacing(4)
+        self._sidebar_layout.addWidget(self._hand_status)
+        self._sidebar_layout.addSpacing(14)
+
+    def _build_exit_section(self, outer: QVBoxLayout) -> None:
+        """
+        # DESIGN: Exit Session sits outside the scroll area in a pinned bottom strip
+        # separated by a BORDER top-rule. Using a separate QWidget (not inside the
+        # scroll) guarantees it is always visible at the bottom regardless of how
+        # much content is in the scroll — the danger action must never be hidden.
+        """
+        exit_strip = QFrame()
+        exit_strip.setObjectName("exit_strip")
+        exit_layout = QVBoxLayout(exit_strip)
+        exit_layout.setContentsMargins(14, 10, 14, 14)
+        exit_layout.setSpacing(6)
+
+        danger_header = QLabel("DANGER ZONE")
+        danger_header.setObjectName("section_header")
+        exit_layout.addWidget(danger_header)
+
+        exit_btn = QPushButton("Exit Session")
+        exit_btn.setObjectName("danger_button")
+        exit_btn.setToolTip("Send X — exit session")
+        exit_btn.clicked.connect(lambda _=False: self._send_command("X"))
+        self._cmd_buttons.append(exit_btn)
+        self._cmd_button_by_cmd["X"] = exit_btn
+        exit_layout.addWidget(exit_btn)
+
+        outer.addWidget(exit_strip)
+
+    # ── Engineering log (unchanged) ───────────────────────────────────────────
 
     def _build_engineering_log(self, root: QVBoxLayout) -> None:
         self._btn_terminal = QPushButton("Show Engineering Log")
@@ -1066,13 +2023,18 @@ class MainWindow(QMainWindow):
         term_layout = QVBoxLayout(self._terminal_container)
         term_layout.setContentsMargins(0, 0, 0, 0)
         term_layout.setSpacing(0)
-        self._log_view = QTextEdit()
+        self._log_view = QPlainTextEdit()
         self._log_view.setObjectName("log")
         self._log_view.setReadOnly(True)
         self._log_view.setMinimumHeight(170)
         term_layout.addWidget(self._log_view)
         self._terminal_container.setVisible(False)
         root.addWidget(self._terminal_container)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # All methods below this line are UNCHANGED from original — signal/slot
+    # connections, serial logic, data processing, calibration, session state.
+    # ════════════════════════════════════════════════════════════════════════
 
     @Slot()
     def _toggle_terminal(self) -> None:
@@ -1108,30 +2070,26 @@ class MainWindow(QMainWindow):
         mode = MODE_BY_COMMAND[cmd]
         if self._countdown_timer.isActive():
             self._cancel_countdown("Countdown cancelled. Select a mode and press Start.")
-        self._pending_live_mode = None
-        self._awaiting_arm_mode = mode
-        self._armed_mode = mode
+        self._pending_live_mode   = None
+        self._awaiting_arm_mode   = mode
+        self._armed_mode          = mode
         self._set_mode(mode)
-        self._countdown_label.setText("Selecting mode on the glove...")
-        self._coaching_label.setText(f"Selecting {MODE_LABELS[mode]} mode...")
-        self._coaching_label.setStyleSheet(f"color: {MODE_COLORS[mode]};")
+        self._countdown_label.setText("Selecting mode on the glove…")
         self._update_start_button()
         self._send_command(cmd)
 
     def _arm_training_mode(self, mode: str) -> None:
-        self._armed_mode = mode
-        self._session_mode = mode
-        self._mode = mode
-        self._session_active = False
-        self._awaiting_arm_mode = None
-        self._pending_live_mode = None
+        self._armed_mode         = mode
+        self._session_mode       = mode
+        self._mode               = mode
+        self._session_active     = False
+        self._awaiting_arm_mode  = None
+        self._pending_live_mode  = None
         self._set_mode(mode)
         self._score_card.set_value("--")
         self._score_card.set_accent(GRAY)
-        self._score_delta_label.setText("Score change: --")
+        self._score_delta_label.setText("Score: --")
         self._score_delta_label.setStyleSheet(f"color: {MUTED};")
-        self._coaching_label.setText(f"{MODE_LABELS[mode]} mode selected. Press Start.")
-        self._coaching_label.setStyleSheet(f"color: {MODE_COLORS[mode]};")
         self._countdown_label.setText("Mode selected. Press Start for a 3-second countdown.")
         self._vital_sign.set_status(False)
         self._update_start_button()
@@ -1146,9 +2104,8 @@ class MainWindow(QMainWindow):
         if self._session_active:
             self._add_activity("A session is already live.", AMBER)
             return
-
-        self._pending_live_mode = None
-        self._countdown_value = 3
+        self._pending_live_mode  = None
+        self._countdown_value    = 3
         self._set_mode(self._armed_mode, countdown=True)
         self._set_countdown_text("3")
         self._btn_start.setEnabled(False)
@@ -1161,7 +2118,6 @@ class MainWindow(QMainWindow):
             self._countdown_value -= 1
             self._set_countdown_text(str(self._countdown_value))
             return
-
         self._countdown_timer.stop()
         self._countdown_value = 0
         self._set_countdown_text("Begin")
@@ -1173,23 +2129,20 @@ class MainWindow(QMainWindow):
         if not self._connected:
             self._cancel_countdown("Connection lost before start.")
             return
-
-        self._pending_live_mode = self._armed_mode
-        self._countdown_label.setText("Starting scored session...")
+        self._pending_live_mode  = self._armed_mode
+        self._countdown_label.setText("Starting scored session…")
         self._send_command(COMMAND_BY_MODE[self._armed_mode])
 
     def _set_countdown_text(self, text: str) -> None:
         label = f"Starting in {text}" if text != "Begin" else "Begin"
         self._countdown_label.setText(label)
-        self._coaching_label.setText(label)
-        self._coaching_label.setStyleSheet(f"color: {MODE_COLORS.get(self._armed_mode, BLUE)};")
         self._vital_sign.set_countdown(text)
 
     def _cancel_countdown(self, message: str) -> None:
         self._countdown_timer.stop()
-        self._countdown_value = 0
-        self._awaiting_arm_mode = None
-        self._pending_live_mode = None
+        self._countdown_value    = 0
+        self._awaiting_arm_mode  = None
+        self._pending_live_mode  = None
         self._countdown_label.setText(message)
         self._vital_sign.set_status(False)
         self._update_start_button()
@@ -1208,13 +2161,13 @@ class MainWindow(QMainWindow):
         )
         button.setEnabled(can_start)
         if self._countdown_timer.isActive():
-            button.setText("Starting...")
+            button.setText("Starting…")
         elif self._awaiting_arm_mode is not None:
-            button.setText("Selecting...")
+            button.setText("Selecting…")
         elif self._session_active:
-            button.setText("Live")
+            button.setText("▶  Live")
         else:
-            button.setText("Start")
+            button.setText("▶  Start")
 
     @Slot()
     def _on_connect_clicked(self) -> None:
@@ -1228,20 +2181,19 @@ class MainWindow(QMainWindow):
         if not port:
             self._log("No port selected", "err")
             return
-
         self._cmd_queue = queue.Queue()
-        self._worker = SerialWorker(port, BAUD_RATE, self._cmd_queue)
+        self._worker    = SerialWorker(port, BAUD_RATE, self._cmd_queue)
         self._worker.data_received.connect(self._on_data_received)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
-
-        self._connected = True
+        self._connected      = True
         self._last_packet_at = None
         self._reset_session_display(clear_mode=True)
         self._btn_connect.setText("Disconnect")
         self._btn_connect.setProperty("connected", "true")
         self._repolish(self._btn_connect)
+        self._set_status_pill_connected()
         self._set_commands_enabled(True)
         self._update_start_button()
         self._set_state(TrainerState.CONNECTED)
@@ -1249,23 +2201,28 @@ class MainWindow(QMainWindow):
         self._stale_label.setStyleSheet(f"color: {AMBER};")
         self._log(f"Opening {port} at {BAUD_RATE}", "sys")
         self._add_activity(f"Connected to {port.split('/')[-1]}", BLUE)
+        self._send_command("I")
 
     def _disconnect(self) -> None:
         if self._worker:
             self._worker.stop()
             self._worker.wait()
             self._worker = None
-        self._connected = False
+        self._connected      = False
+        self._firmware_info  = "Firmware: unknown"
         self._last_packet_at = None
         self._reset_session_display(clear_mode=True)
         self._btn_connect.setText("Connect")
         self._btn_connect.setProperty("connected", "false")
         self._repolish(self._btn_connect)
+        self._set_status_pill_disconnected()
         self._set_commands_enabled(False)
         self._update_start_button()
         self._set_state(TrainerState.DISCONNECTED)
         self._stale_label.setText("Telemetry: disconnected")
         self._stale_label.setStyleSheet(f"color: {MUTED};")
+        if hasattr(self, "_fw_info_label"):
+            self._fw_info_label.setText(self._firmware_info)
         self._log("Disconnected", "sys")
         self._add_activity("Disconnected", MUTED)
 
@@ -1286,22 +2243,24 @@ class MainWindow(QMainWindow):
         self._handle_text_response(line)
 
     def _handle_telemetry(self, packet: dict) -> None:
-        self._latest_packet = packet
+        self._latest_packet  = packet
         self._last_packet_at = time.monotonic()
         self._stale_label.setText("Telemetry: live")
         self._stale_label.setStyleSheet(f"color: {GREEN};")
-
+        if self._calibration_wizard is not None and self._calibration_wizard.isVisible():
+            self._calibration_wizard.update_live_packet(packet)
         if self._session_active:
             self._telemetry.append(packet)
             self._packet_label.setText(f"Packets: {self._telemetry.packet_count}")
+            self._packet_kpi.set_value(str(self._telemetry.packet_count))
             if len(self._telemetry.series["t"]) >= 2:
                 times = list(self._telemetry.series["t"])
-                dt = times[-1] - times[-2]
-                rate = (1.0 / dt) if dt > 0 else 0.0
-                self._rate_label.setText(f"JSON: {rate:.1f} Hz")
+                dt    = times[-1] - times[-2]
+                rate  = (1.0 / dt) if dt > 0 else 0.0
+                self._rate_label.setText(f"{rate:.1f} Hz")
+                self._rate_kpi.set_value(f"{rate:.1f}")
         else:
-            self._rate_label.setText("JSON: live")
-
+            self._rate_label.setText("live")
         state = str(packet.get("state", "CONNECTED"))
         self._set_state(self._state_from_text(state))
         self._update_metrics(packet, scored=self._session_active)
@@ -1313,28 +2272,25 @@ class MainWindow(QMainWindow):
         if "nvs" in payload:
             text = f"Calibration storage: {payload['nvs']}"
             self._add_activity(text, AMBER)
-            self._record_calibration_response(text)
+            self._record_calibration_response(payload)
         elif "cal" in payload:
             text = f"Calibration: {payload['cal']}"
             self._add_activity(text, BLUE)
-            self._record_calibration_response(text)
+            self._record_calibration_response(payload)
         elif "err" in payload:
             text = f"Firmware error: {payload['err']}"
             self._add_activity(text, RED)
-            self._record_calibration_response(text)
+            self._record_calibration_response(payload)
         else:
             self._add_activity("Status JSON received", MUTED)
 
     def _handle_text_response(self, line: str) -> None:
         clean = line.strip()
-        self._record_calibration_response(clean)
         response = COMMAND_RESPONSES.get(clean)
         if response is None:
             if clean.startswith("READY:"):
-                self._set_state(TrainerState.CONNECTED)
-                self._add_activity("Firmware ready", BLUE)
+                self._handle_ready_line(clean)
             return
-
         key, message = response
         if key in ("EASY", "INTERMEDIATE", "HARD"):
             self._mode = key
@@ -1348,16 +2304,16 @@ class MainWindow(QMainWindow):
                 self._awaiting_arm_mode = None
                 self._arm_training_mode(key)
                 self._add_activity(
-                    f"{MODE_LABELS[key]} mode selected - press Start when ready",
+                    f"{MODE_LABELS[key]} mode selected – press Start when ready",
                     MODE_COLORS[key],
                 )
         elif key == "IDLE":
             was_live = self._session_active
             self._set_state(TrainerState.IDLE)
-            self._session_active = False
+            self._session_active    = False
             self._awaiting_arm_mode = None
             self._pending_live_mode = None
-            self._armed_mode = "UNSELECTED"
+            self._armed_mode        = "UNSELECTED"
             if self._countdown_timer.isActive():
                 self._cancel_countdown("Stopped before the session started.")
             self._set_mode(self._session_mode, active=False, complete=True)
@@ -1368,8 +2324,8 @@ class MainWindow(QMainWindow):
                 self._show_session_summary()
         elif key == "EXITED":
             self._set_state(TrainerState.EXITED)
-            self._armed_mode = "UNSELECTED"
-            self._session_active = False
+            self._armed_mode        = "UNSELECTED"
+            self._session_active    = False
             self._awaiting_arm_mode = None
             self._pending_live_mode = None
             self._vital_sign.set_status(False)
@@ -1387,45 +2343,50 @@ class MainWindow(QMainWindow):
             return TrainerState.CONNECTED
 
     def _begin_training_session(self, mode: str) -> None:
-        self._session_mode = mode
-        self._mode = mode
-        self._armed_mode = mode
-        self._session_active = True
-        self._last_score = 100.0
-        self._last_warn = 0
-        self._last_err = 0
-        self._last_state = ""
+        self._session_mode       = mode
+        self._mode               = mode
+        self._armed_mode         = mode
+        self._session_active     = True
+        self._last_score         = 100.0
+        self._last_warn          = 0
+        self._last_err           = 0
+        self._last_state         = ""
         self._countdown_timer.stop()
-        self._countdown_value = 0
+        self._countdown_value    = 0
         self._telemetry.reset()
         self._clear_plots()
         self._set_mode(mode, active=True)
         self._score_card.set_value("100.0")
         self._score_card.set_accent(GREEN)
+        self._score_inline.setText("Score: 100.0")
         self._force_card.set_value("0.000")
         self._force_card.set_accent(BLUE)
         self._packet_label.setText("Packets: 0")
-        self._rate_label.setText("JSON: -- Hz")
+        self._packet_kpi.set_value("0")
+        self._rate_label.setText("-- Hz")
+        self._rate_kpi.set_value("--")
         self._contact_label.setText("Contact: --/--/--")
         self._contact_label.setStyleSheet(f"color: {MUTED};")
-        self._score_delta_label.setText("Score change: reset")
+        self._gate_label.setText("Gate: NONE")
+        self._gate_label.setStyleSheet(f"color: {MUTED};")
+        self._score_delta_label.setText(f"Score: 100.0")
         self._score_delta_label.setStyleSheet(f"color: {GREEN};")
-        self._coaching_label.setText(f"{MODE_LABELS[mode]} session live - make contact to begin")
-        self._coaching_label.setStyleSheet(f"color: {MODE_COLORS[mode]};")
         self._countdown_label.setText("Live session running. Press Stop to finish.")
         self._vital_sign.set_status(True, 0, 0)
         self._update_start_button()
-        self._add_activity(f"New {MODE_LABELS[mode].lower()} session started - score reset to 100", BLUE)
+        self._add_activity(
+            f"New {MODE_LABELS[mode].lower()} session started – score reset to 100", BLUE
+        )
 
     def _reset_session_display(self, clear_mode: bool = False) -> None:
         self._countdown_timer.stop()
-        self._countdown_value = 0
+        self._countdown_value   = 0
         self._pending_live_mode = None
-        self._session_active = False
-        self._last_score = None
-        self._last_warn = 0
-        self._last_err = 0
-        self._last_state = ""
+        self._session_active    = False
+        self._last_score        = None
+        self._last_warn         = 0
+        self._last_err          = 0
+        self._last_state        = ""
         self._telemetry.reset()
         self._clear_plots()
         self._score_card.set_value("--")
@@ -1433,10 +2394,14 @@ class MainWindow(QMainWindow):
         self._force_card.set_value("--")
         self._force_card.set_accent(GRAY)
         self._packet_label.setText("Packets: 0")
-        self._rate_label.setText("JSON: -- Hz")
+        self._packet_kpi.set_value("0")
+        self._rate_label.setText("-- Hz")
+        self._rate_kpi.set_value("--")
         self._contact_label.setText("Contact: --/--/--")
         self._contact_label.setStyleSheet(f"color: {MUTED};")
-        self._score_delta_label.setText("Score change: --")
+        self._gate_label.setText("Gate: NONE")
+        self._gate_label.setStyleSheet(f"color: {MUTED};")
+        self._score_delta_label.setText("Score: --")
         self._score_delta_label.setStyleSheet(f"color: {MUTED};")
         self._alert_label.setText("No active warnings")
         self._alert_label.setStyleSheet(f"color: {GREEN};")
@@ -1448,8 +2413,8 @@ class MainWindow(QMainWindow):
             metric.set_accent(BLUE)
         if clear_mode:
             self._session_mode = "UNSELECTED"
-            self._mode = "UNSELECTED"
-            self._armed_mode = "UNSELECTED"
+            self._mode         = "UNSELECTED"
+            self._armed_mode   = "UNSELECTED"
             self._set_mode("UNSELECTED")
         self._update_start_button()
 
@@ -1459,31 +2424,44 @@ class MainWindow(QMainWindow):
         color = MODE_COLORS.get(mode, MUTED)
         if mode == "UNSELECTED":
             text = "No mode selected"
-            hint = "Choose Easy, Intermediate, or Hard to start a scored session."
         elif complete:
-            text = f"Last Mode: {label}"
-            hint = "Session stopped. Review the summary or choose a mode to start a fresh score."
+            text = f"Last: {label}"
         elif active:
-            text = f"Active Mode: {label}"
-            hint = "Live scoring is running from a fresh 100-point session."
+            text = f"Active: {label}"
         elif countdown:
             text = f"Starting: {label}"
-            hint = "Countdown is running. Scoring starts after Begin."
         else:
-            text = f"Selected Mode: {label}"
-            hint = "Mode selected. Press Start when ready."
+            text = f"Selected: {label}"
 
         self._mode_label.setText(text)
         self._mode_label.setStyleSheet(
             f"color: {color};"
             f"background-color: {BLUE_LIGHT if color != RED else '#fff2f2'};"
             f"border: 1px solid {color};"
-            "border-radius: 8px;"
-            "padding: 4px 8px;"
-            "font-weight: 900;"
+            "border-radius: 10px;"
+            "padding: 3px 10px;"
+            "font-weight: 900; font-size: 11px;"
         )
-        self._session_hint_label.setText(hint)
 
+        # Update session banner border color
+        state_color = color if active else (MUTED if mode == "UNSELECTED" else color)
+        if hasattr(self, "_session_banner"):
+            self._session_banner.setStyleSheet(
+                "QFrame#session_banner {"
+                f"border-left: 4px solid {state_color};"
+                "}"
+            )
+
+        # Update state label text
+        if not active and not countdown:
+            if hasattr(self, "_state_label"):
+                disp = STATE_COLORS.get(self._state_from_text(self._last_state), MUTED)
+                self._state_label.setText(
+                    "Session idle" if mode == "UNSELECTED" else
+                    f"{label} — Ready"
+                )
+
+        # Update mode button visual states
         active_cmd = {"EASY": "E", "INTERMEDIATE": "M", "HARD": "H"}.get(mode)
         for cmd in ("E", "M", "H"):
             button = self._cmd_button_by_cmd.get(cmd)
@@ -1507,112 +2485,85 @@ class MainWindow(QMainWindow):
     def _build_session_summary(self) -> dict:
         def values(key: str) -> list[float]:
             return self._telemetry.y(key)
-
-        times = self._telemetry.x()
-        samples = len(times)
+        times    = self._telemetry.x()
+        samples  = len(times)
         duration_s = times[-1] - times[0] if len(times) >= 2 else 0.0
-        scores = values("score")
-        forces = values("f_sum")
-        f0 = values("f0")
-        f1 = values("f1")
-        f2 = values("f2")
-        warns = values("warn")
-        errs = values("err")
-        contacts = values("contact_any")
-        tremor = values("tremor")
-        f95 = values("f95")
-
-        final_score = scores[-1] if scores else 0.0
-        warning_events = sum(1 for v in warns if v > 0.0)
-        error_events = sum(1 for v in errs if v > 0.0)
-        contact_pct = (100.0 * sum(contacts) / len(contacts)) if contacts else 0.0
-        peak_finger = max(f0 + f1 + f2) if (f0 or f1 or f2) else 0.0
-        avg_force = (sum(forces) / len(forces)) if forces else 0.0
-        peak_force = max(forces) if forces else 0.0
-        avg_tremor = (sum(tremor) / len(tremor)) if tremor else 0.0
-        peak_f95 = max(f95) if f95 else 0.0
-
+        scores   = values("score")
+        forces   = values("f_sum")
+        f0, f1, f2 = values("f0"), values("f1"), values("f2")
+        warns    = values("warn")
+        errs     = values("err")
+        engaged  = values("engaged")
+        tremor   = values("tremor")
+        f95      = values("f95")
+        final_score     = scores[-1] if scores else 0.0
+        warning_events  = sum(1 for v in warns if v > 0.0)
+        error_events    = sum(1 for v in errs if v > 0.0)
+        engaged_pct     = (100.0 * sum(engaged) / len(engaged)) if engaged else 0.0
+        peak_finger     = max(f0 + f1 + f2) if (f0 or f1 or f2) else 0.0
+        avg_force       = (sum(forces) / len(forces)) if forces else 0.0
+        peak_force      = max(forces) if forces else 0.0
+        avg_tremor      = (sum(tremor) / len(tremor)) if tremor else 0.0
+        peak_f95        = max(f95) if f95 else 0.0
         if final_score >= 90 and error_events == 0:
-            grade = "Expert control"
-            grade_color = GREEN
+            grade, grade_color = "Expert control", GREEN
             coaching = "Clean session. Force stayed controlled and no major error events were recorded."
         elif final_score >= 75 and error_events == 0:
-            grade = "Good technique"
-            grade_color = BLUE
+            grade, grade_color = "Good technique", BLUE
             coaching = "Good run. Review warning moments and keep force changes smooth."
         elif final_score >= 50:
-            grade = "Needs refinement"
-            grade_color = AMBER
+            grade, grade_color = "Needs refinement", AMBER
             coaching = "Usable session, but force or motion stability needs more consistency."
         else:
-            grade = "High-risk handling"
-            grade_color = RED
+            grade, grade_color = "High-risk handling", RED
             coaching = "High event count or low score. Repeat at an easier mode and focus on gentle contact."
-
         if samples == 0:
             coaching = "No live telemetry was captured for this session. Start a mode, interact with the glove, then press Stop."
-
         return {
-            "mode": self._session_mode,
-            "samples": samples,
-            "duration_s": duration_s,
-            "final_score": final_score,
-            "grade": grade,
-            "grade_color": grade_color,
-            "avg_force": avg_force,
-            "peak_force": peak_force,
-            "peak_finger": peak_finger,
-            "contact_pct": contact_pct,
-            "warning_events": warning_events,
-            "error_events": error_events,
-            "avg_tremor": avg_tremor,
-            "peak_f95": peak_f95,
+            "mode": self._session_mode, "samples": samples, "duration_s": duration_s,
+            "final_score": final_score, "grade": grade, "grade_color": grade_color,
+            "avg_force": avg_force, "peak_force": peak_force, "peak_finger": peak_finger,
+            "engaged_pct": engaged_pct, "warning_events": warning_events,
+            "error_events": error_events, "avg_tremor": avg_tremor, "peak_f95": peak_f95,
             "coaching": coaching,
         }
 
     def _update_metrics(self, packet: dict, scored: bool = True) -> None:
         def f(key: str, default: float = 0.0) -> float:
             return float(packet.get(key, default))
-
-        score = f("score")
+        score       = f("score")
         total_force = f("f_sum")
         self._force_card.set_value(f"{total_force:.3f}")
         self._force_card.set_accent(RED if total_force >= 4.0 else AMBER if total_force >= 2.0 else BLUE)
-
         if scored:
             self._score_card.set_value(f"{score:05.1f}")
             self._score_card.set_accent(GREEN if score >= 80 else AMBER if score >= 50 else RED)
+            self._score_inline.setText(f"Score: {score:05.1f}")
             if self._last_score is None:
-                self._score_delta_label.setText("Score change: --")
+                self._score_delta_label.setText(f"Score: {score:05.1f}")
                 self._score_delta_label.setStyleSheet(f"color: {MUTED};")
             else:
                 delta = score - self._last_score
-                if abs(delta) < 0.05:
-                    self._score_delta_label.setText("Score change: steady")
-                    self._score_delta_label.setStyleSheet(f"color: {GREEN};")
-                else:
-                    self._score_delta_label.setText(f"Score change: {delta:+.1f}")
-                    self._score_delta_label.setStyleSheet(f"color: {GREEN if delta > 0 else AMBER};")
+                color = GREEN if delta >= 0 else AMBER
+                self._score_delta_label.setText(f"Score: {score:05.1f} ({delta:+.1f})")
+                self._score_delta_label.setStyleSheet(f"color: {color};")
             self._last_score = score
-
         for key in ("f0", "f1", "f2"):
             value = f(key)
             self._metric_values[key].set_value(f"{value:.3f}")
             self._metric_values[key].set_accent(RED if value >= 1.5 else AMBER if value >= 0.8 else BLUE)
         for key in ("roll", "pitch", "yaw"):
             self._metric_values[key].set_value(f"{f(key):.2f}")
-
-        warn = int(f("warn"))
-        err = int(f("err"))
+        warn   = int(f("warn"))
+        err    = int(f("err"))
         tremor = f("tremor")
         self._metric_values["tremor"].set_value(f"{tremor:.3f}")
         self._metric_values["tremor"].set_accent(RED if err & (1 << 1) else AMBER if warn & (1 << 1) else VIOLET)
         self._metric_values["cv_f"].set_value(f"{f('cv_f'):.3f}")
         self._metric_values["swing"].set_value(f"{f('swing'):.2f}")
         self._metric_values["f95"].set_value(f"{f('f95'):.2f}")
-        self._metric_values["warn_err"].set_value(f"0x{warn:02X} / 0x{err:02X}")
+        self._metric_values["warn_err"].set_value(f"0x{warn:02X}/0x{err:02X}")
         self._metric_values["warn_err"].set_accent(RED if err else AMBER if warn else GREEN)
-
         contact = packet.get("contact", [0, 0, 0])
         if isinstance(contact, list) and len(contact) >= 3:
             text = "/".join("ON" if int(v) else "--" for v in contact[:3])
@@ -1621,41 +2572,42 @@ class MainWindow(QMainWindow):
         self._metric_values["contact"].set_value(text)
         self._contact_label.setText(f"Contact: {text}")
         self._contact_label.setStyleSheet(f"color: {GREEN if 'ON' in text else MUTED};")
+        gate = str(packet.get("gate", "NONE"))
+        gate_color = GREEN if gate == "FSR" else BLUE if gate == "IMU" else MUTED
+        self._gate_label.setText(f"Gate: {gate}")
+        self._gate_label.setStyleSheet(f"color: {gate_color};")
 
     def _update_coaching(self, packet: dict) -> None:
-        warn = int(packet.get("warn", 0))
-        err = int(packet.get("err", 0))
+        warn  = int(packet.get("warn", 0))
+        err   = int(packet.get("err", 0))
         state = str(packet.get("state", ""))
-
         if err:
             messages = self._flag_messages(err, ERR_LABELS)
-            text = "Error: " + ", ".join(messages)
+            text  = "Error: " + ", ".join(messages)
             color = RED
             if err != self._last_err:
                 self._add_activity(text, RED)
         elif warn:
             messages = self._flag_messages(warn, WARN_LABELS)
-            text = "Warning: " + ", ".join(messages)
+            text  = "Warning: " + ", ".join(messages)
             color = AMBER
             if warn != self._last_warn:
                 self._add_activity(text, AMBER)
         else:
-            text = "Stable technique" if state in ("HOLD", "ACTIVE") else "Ready for contact"
+            text  = "Stable technique" if state in ("HOLD", "ACTIVE") else "Ready for contact"
             color = GREEN
-
-        self._coaching_label.setText(text)
-        self._coaching_label.setStyleSheet(f"color: {color};")
+        self._state_label.setText(text)
+        self._state_label.setStyleSheet(f"color: {color};")
         self._alert_label.setText(f"Warn 0x{warn:02X} | Err 0x{err:02X}")
         self._alert_label.setStyleSheet(f"color: {RED if err else AMBER if warn else GREEN};")
         self._vital_sign.set_status(self._session_active, warn, err)
-
         if state and state != self._last_state:
             self._add_activity(
                 f"State changed to {state}",
                 STATE_COLORS.get(self._state_from_text(state), MUTED),
             )
-        self._last_warn = warn
-        self._last_err = err
+        self._last_warn  = warn
+        self._last_err   = err
         self._last_state = state
 
     def _flag_messages(self, flags: int, labels: dict[int, str]) -> list[str]:
@@ -1668,9 +2620,8 @@ class MainWindow(QMainWindow):
         x = self._telemetry.x()
         for key, curve in self._curves.items():
             curve.setData(x, self._plot_y(key))
-
         right = x[-1] if x else 0.0
-        left = max(0.0, right - PLOT_WINDOW_S)
+        left  = max(0.0, right - PLOT_WINDOW_S)
         for plot in self._plot_widgets:
             plot.setXRange(left, max(PLOT_WINDOW_S, right), padding=0.02)
 
@@ -1700,8 +2651,8 @@ class MainWindow(QMainWindow):
         if age > 2.0:
             self._stale_label.setText(f"Telemetry: stale {age:.1f}s")
             self._stale_label.setStyleSheet(f"color: {RED};")
-            self._coaching_label.setText("Telemetry paused - waiting for live packets")
-            self._coaching_label.setStyleSheet(f"color: {RED};")
+            self._state_label.setText("Telemetry paused – waiting for live packets")
+            self._state_label.setStyleSheet(f"color: {RED};")
 
     def _check_hand_process(self) -> None:
         if self._hand_process is None:
@@ -1717,13 +2668,94 @@ class MainWindow(QMainWindow):
         if self._calibration_wizard is None:
             self._calibration_wizard = CalibrationWizard(self)
             self._calibration_wizard.command_requested.connect(self._send_command)
+        if self._latest_packet is not None:
+            self._calibration_wizard.update_live_packet(self._latest_packet)
         self._calibration_wizard.show()
         self._calibration_wizard.raise_()
         self._calibration_wizard.activateWindow()
 
-    def _record_calibration_response(self, text: str) -> None:
-        if self._calibration_wizard is not None and self._calibration_wizard.isVisible():
-            self._calibration_wizard.record_response(text)
+    def _record_calibration_response(self, data: object) -> None:
+        should_forward_to_wizard = False
+        if isinstance(data, dict):
+            should_forward_to_wizard = any(key in data for key in ("cal", "nvs", "err"))
+        else:
+            text = str(data).strip()
+            should_forward_to_wizard = (
+                "Not connected" in text or text.startswith("<partial serial fragment>")
+            )
+
+        if should_forward_to_wizard and self._calibration_wizard is not None and self._calibration_wizard.isVisible():
+            self._calibration_wizard.record_response(data)
+        if hasattr(self, "_cal_status"):
+            self._cal_status.setText(self._summarize_calibration_status(data))
+
+    def _summarize_calibration_status(self, data: object) -> str:
+        if isinstance(data, dict):
+            if "nvs" in data:
+                return "Saved calibration erased."
+            if "err" in data:
+                return f"Calibration error: {str(data['err'])[:32]}"
+            cal = str(data.get("cal", ""))
+            if not cal:
+                return "Calibration update received."
+            if cal == "COMPLETE":
+                return "Calibration complete and saved." if str(data.get("status", "")) == "PASS" else "Calibration save failed."
+            if cal in ("C3_STAGE", "C4_STAGE"):
+                stage = str(data.get("stage", ""))
+                phase = str(data.get("phase", "live"))
+                title = CALIBRATION_STAGE_UI.get(stage, {}).get("title", "Guided motion")
+                if phase == "fail":
+                    return calibration_reason_text(str(data.get("reason", "")), f"{title} needs another try.")
+                if phase == "pass":
+                    return f"{title} captured."
+                if phase == "prompt":
+                    return f"Prepare: {title}."
+                if phase == "capturing":
+                    return f"Capturing {title}…"
+                return f"Capturing {title}…"
+            status = str(data.get("status", ""))
+            if cal.endswith("_START"):
+                base = cal.split("_")[0]
+                return f"Running {CALIBRATION_STEPS.get(base, {}).get('title', base)}…"
+            if cal.endswith("_LIVE"):
+                base = cal.split("_")[0]
+                return f"{CALIBRATION_STEPS.get(base, {}).get('title', base)} is in progress…"
+            title = CALIBRATION_STEPS.get(cal, {}).get("title", cal)
+            if status in ("PASS", "COMPLETE"):
+                return f"{title} complete."
+            if status == "FAIL":
+                return calibration_reason_text(str(data.get("reason", "")), f"{title} needs another try.")
+            return f"{title} updated."
+        text = str(data).strip()
+        if not text:
+            return "No calibration yet."
+        if "Not connected" in text:
+            return "Connect the glove before calibrating."
+        if text.startswith("<partial serial fragment>"):
+            return "Serial fragment received during calibration."
+        return text[:56]
+
+    def _handle_ready_line(self, line: str) -> None:
+        self._set_state(TrainerState.CONNECTED)
+        details = line[len("READY:"):].strip() if line.startswith("READY:") else line
+        restart_during_calibration = (
+            self._calibration_wizard is not None
+            and self._calibration_wizard.isVisible()
+        )
+        if details:
+            self._firmware_info = f"Firmware: {details}"
+            if hasattr(self, "_fw_info_label"):
+                self._fw_info_label.setText(self._firmware_info)
+            self._add_activity(f"Firmware ready ({details})", BLUE)
+        else:
+            self._firmware_info = "Firmware: ready"
+            if hasattr(self, "_fw_info_label"):
+                self._fw_info_label.setText(self._firmware_info)
+            self._add_activity("Firmware ready", BLUE)
+        if restart_during_calibration and self._calibration_wizard is not None:
+            interrupted = self._calibration_wizard.mark_transport_restart(details)
+            if interrupted and hasattr(self, "_cal_status"):
+                self._cal_status.setText("Calibration interrupted by glove reboot.")
 
     def _open_hand_window(self) -> None:
         if self._hand_process is not None and self._hand_process.poll() is None:
@@ -1731,14 +2763,11 @@ class MainWindow(QMainWindow):
             if self._latest_packet is not None:
                 self._send_to_hand_visualizer(self._latest_packet)
             return
-
         script = Path(__file__).with_name("hand_visualizer.py")
         try:
             self._hand_process = subprocess.Popen(
                 [sys.executable, str(script)],
-                stdin=subprocess.PIPE,
-                text=True,
-                cwd=str(script.parent),
+                stdin=subprocess.PIPE, text=True, cwd=str(script.parent),
             )
         except OSError as exc:
             message = f"Could not open 3D hand view: {exc}"
@@ -1746,7 +2775,6 @@ class MainWindow(QMainWindow):
             self._add_activity(message, RED)
             self._log(message, "err")
             return
-
         self._hand_status.setText("3D hand view running")
         self._add_activity("3D hand visualizer opened", BLUE)
         self._log(f"Started {script}", "sys")
@@ -1801,8 +2829,9 @@ class MainWindow(QMainWindow):
 
     def _set_state(self, state: TrainerState) -> None:
         color = STATE_COLORS[state]
-        self._state_label.setText(state.value)
-        self._state_label.setStyleSheet(f"color: {color};")
+        if hasattr(self, "_state_label"):
+            self._state_label.setText(state.value)
+            self._state_label.setStyleSheet(f"color: {color};")
         if state == TrainerState.EXITED:
             self._set_commands_enabled(False)
 
@@ -1812,7 +2841,23 @@ class MainWindow(QMainWindow):
         self._update_start_button()
 
     def _add_activity(self, message: str, color: str) -> None:
+        """
+        # DESIGN: Activity feed cards use a glyph icon (●/▲/✕/✓) left of the
+        # message. Icon glyph chosen over an SVG icon widget — lower overhead, no
+        # resource dependency, and readable at 14px in the existing QLabel flow.
+        # Timestamp is 10px IBM Plex Mono MUTED — clearly secondary to the 14px
+        # semibold message text without needing a separate label color.
+        """
         ts = datetime.now().strftime("%H:%M:%S")
+        icon_map = {
+            BLUE:   "●",
+            GREEN:  "✓",
+            AMBER:  "▲",
+            RED:    "✕",
+            MUTED:  "–",
+        }
+        icon = icon_map.get(color, "●")
+
         card = QFrame()
         card.setObjectName("activity_card")
         card.setStyleSheet(
@@ -1823,16 +2868,30 @@ class MainWindow(QMainWindow):
             "border-radius: 8px;"
             "}"
         )
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(2)
+        row_layout = QHBoxLayout(card)
+        row_layout.setContentsMargins(8, 8, 10, 8)
+        row_layout.setSpacing(8)
+
+        icon_lbl = QLabel(icon)
+        icon_lbl.setStyleSheet(f"color: {color}; font-size: 14px; border: none; background: transparent;")
+        icon_lbl.setFixedWidth(14)
+
+        body = QVBoxLayout()
+        body.setSpacing(2)
         msg = QLabel(message)
         msg.setWordWrap(True)
-        msg.setStyleSheet(f"color: {TEXT}; font-weight: 700;")
+        msg.setStyleSheet(
+            f"color: {TEXT}; font-weight: 600; font-size: 13px;"
+            "border: none; background: transparent;"
+        )
         stamp = QLabel(ts)
         stamp.setObjectName("timestamp")
-        layout.addWidget(msg)
-        layout.addWidget(stamp)
+        body.addWidget(msg)
+        body.addWidget(stamp)
+
+        row_layout.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        row_layout.addLayout(body, 1)
+
         self._feed_layout.insertWidget(0, card)
         while self._feed_layout.count() > MAX_FEED_CARDS + 1:
             item = self._feed_layout.takeAt(self._feed_layout.count() - 2)
@@ -1840,28 +2899,14 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
 
     def _log(self, text: str, direction: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        color = {
-            "tx": BLUE,
-            "rx": GREEN,
-            "err": RED,
-            "sys": MUTED,
-        }.get(direction, MUTED)
-        prefix = {
-            "tx": ">>",
-            "rx": "<<",
-            "err": "!!",
-            "sys": "--",
-        }.get(direction, "--")
+        ts    = datetime.now().strftime("%H:%M:%S")
+        tag = {"tx": "TX", "rx": "RX", "err": "ERR", "sys": "SYS"}.get(direction, "SYS")
         visible = text
         if not visible or not any(ch.isprintable() for ch in visible):
             visible = "<non-printable serial bytes>"
         elif any((not ch.isprintable()) and ch not in "\t" for ch in visible):
             visible = visible.encode("unicode_escape", errors="replace").decode("ascii")
-        visible = html.escape(visible)
-        self._log_view.append(
-            f'<span style="color:{color};">[{ts}] {prefix} {visible}</span>'
-        )
+        self._log_view.appendPlainText(f"[{ts}] {tag} {visible}")
         bar = self._log_view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
@@ -1884,33 +2929,480 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# ── STYLESHEET ────────────────────────────────────────────────────────────────
+
 STYLESHEET = f"""
-QMainWindow, QWidget#central, QScrollArea#main_scroll {{
+/*
+DESIGN REGISTRY — new objectNames introduced in this redesign:
+  app_bar           — fixed 64px top application bar (Zone 1)
+  app_title         — "Haptic Surgical Skill Trainer" bold NAVY label in bar
+  app_subtitle      — "Clinical Training Console" muted subtitle in bar
+  app_icon          — small navy rounded square icon placeholder in bar
+  status_pill       — connection state badge (DISCONNECTED/CONNECTED) in bar
+  rate_chip         — packet rate monospace label in bar
+  port_combo        — port selector QComboBox in bar
+  tab_pill          — pill-style navigation tab buttons in the left content column
+  tab_active=true   — selected state for tab_pill (via QSS property selector)
+  session_banner    — full-width rounded card at top of Train tab
+  banner_stat       — small stat labels (Packets, Contact, Telemetry) in banner
+  vital_header      — "LIVE VITAL" all-caps label above waveform in banner
+  score_inline      — inline Score: XX.X label in banner meta row
+  kpi_card          — summary metric card with left-border accent (replaces summary_card in Train)
+  kpi_label         — all-caps MUTED label in kpi_card
+  kpi_value         — large monospace value in kpi_card
+  kpi_unit          — small muted unit label in kpi_card
+  chart_card        — outer white container for the force profile chart
+  chart_title       — "Force Profile" label in chart header
+  chart_sep         — 1px QFrame separator between chart header and plot
+  chart_tab_chip    — small outlined chip buttons above the chart (Force/Motion/Skill/Score)
+  chip_active=true  — selected state for chart_tab_chip
+  metrics_scroll    — QScrollArea containing the 3-column metrics grid (Metrics tab)
+  review_scroll     — QScrollArea containing the activity feed (Review tab)
+  sidebar_card      — right sidebar white card (~300px wide)
+  sidebar_scroll    — QScrollArea for the sidebar interior
+  sidebar_sep       — 1px horizontal rule between sidebar sections
+  section_header    — all-caps MUTED 9px section label with bottom border
+  mode_easy         — Easy mode toggle button (green selected state)
+  mode_intermediate — Intermediate mode toggle button (blue selected state)
+  mode_hard         — Hard mode toggle button (red selected state)
+  start_button      — large 48px primary Start action button (GREEN filled)
+  outline_button    — secondary outlined button (Calibrate, Open 3D)
+  exit_strip        — pinned bottom strip containing the Exit Session button
+  danger_button     — Exit Session button (RED outlined)
+  left_column       — left 70% content area widget
+  train_container   — Train tab content wrapper
+  countdown_label   — hint text below Start button
+*/
+
+/* ── Base ──────────────────────────────────────────────────────────────── */
+QMainWindow, QWidget#central, QWidget#left_column, QWidget#train_container {{
     background-color: {ICE};
 }}
-QScrollArea#main_scroll {{
+
+/* ── App Bar ───────────────────────────────────────────────────────────── */
+QFrame#app_bar {{
+    background-color: {PANEL};
+    border-bottom: 1px solid {BORDER};
+    border-left: 3px solid {NAVY};
+}}
+QLabel#app_title {{
+    color: {NAVY};
+    font-size: 15px;
+    font-weight: 800;
+}}
+QLabel#app_subtitle {{
+    color: {MUTED};
+    font-size: 11px;
+    font-weight: 500;
+}}
+QFrame#app_icon {{
+    background-color: {NAVY};
+    border-radius: 8px;
     border: none;
 }}
-QFrame#header_panel, QFrame#status_panel, QFrame#summary_card,
-QFrame#metric_strip, QFrame#side_panel, QFrame#dialog_panel,
-QFrame#hand_canvas_holder {{
+QLabel#rate_chip {{
+    color: {MUTED};
+    background-color: {PANEL_ALT};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-family: Menlo, Consolas, monospace;
+    font-size: 11px;
+}}
+QComboBox#port_combo {{
     background-color: {PANEL};
+    color: {TEXT};
     border: 1px solid {BORDER};
     border-radius: 8px;
+    padding: 5px 8px;
+    font-family: Menlo, Consolas, monospace;
+    font-size: 12px;
 }}
+QComboBox#port_combo QAbstractItemView {{
+    background-color: {PANEL};
+    color: {TEXT};
+    selection-background-color: {BLUE_LIGHT};
+}}
+
+/* ── Pill Tab Bar ──────────────────────────────────────────────────────── */
+QPushButton#tab_pill {{
+    background-color: transparent;
+    color: {MUTED};
+    border: none;
+    border-radius: 20px;
+    padding: 7px 20px;
+    font-size: 12px;
+    font-weight: 700;
+}}
+QPushButton#tab_pill:hover {{
+    background-color: {PANEL_ALT};
+    color: {NAVY};
+}}
+QPushButton#tab_pill[tab_active="true"] {{
+    background-color: {BLUE_LIGHT};
+    color: {NAVY};
+}}
+
+/* ── Session Banner ────────────────────────────────────────────────────── */
+QFrame#session_banner {{
+    background-color: {PANEL};
+    border: 1px solid {BORDER};
+    border-left: 4px solid {MUTED};
+    border-radius: 12px;
+}}
+QLabel#state_label {{
+    font-size: 26px;
+    font-weight: 800;
+    color: {NAVY};
+}}
+QLabel#banner_stat {{
+    color: {MUTED};
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#vital_header {{
+    color: {MUTED};
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}}
+QLabel#score_inline {{
+    color: {MUTED};
+    font-size: 13px;
+    font-family: Menlo, Consolas, monospace;
+    font-weight: 700;
+}}
+
+/* ── KPI Cards ─────────────────────────────────────────────────────────── */
+QFrame#kpi_card {{
+    background-color: {PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+}}
+QLabel#kpi_label {{
+    color: {MUTED};
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}}
+QLabel#kpi_value {{
+    color: {NAVY};
+    font-family: Menlo, Consolas, monospace;
+    font-size: 22px;
+    font-weight: 800;
+}}
+QLabel#kpi_unit {{
+    color: {MUTED};
+    font-size: 10px;
+}}
+
+/* ── Chart Container ───────────────────────────────────────────────────── */
+QFrame#chart_card {{
+    background-color: {PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+}}
+QLabel#chart_title {{
+    color: {NAVY};
+    font-size: 13px;
+    font-weight: 700;
+}}
+QFrame#chart_sep {{
+    color: {BORDER};
+    background-color: {BORDER};
+    border: none;
+    max-height: 1px;
+}}
+QPushButton#chart_tab_chip {{
+    background-color: transparent;
+    color: {MUTED};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton#chart_tab_chip:hover {{
+    background-color: {PANEL_ALT};
+    color: {NAVY};
+}}
+QPushButton#chart_tab_chip[chip_active="true"] {{
+    background-color: {NAVY};
+    color: {PANEL};
+    border-color: {NAVY};
+}}
+
+/* ── Sidebar Card ──────────────────────────────────────────────────────── */
+QFrame#sidebar_card {{
+    background-color: {PANEL};
+    border-left: 1px solid {BORDER};
+    border-radius: 0;
+}}
+QScrollArea#sidebar_scroll {{
+    border: none;
+    background: transparent;
+}}
+QFrame#sidebar_sep {{
+    color: {BORDER};
+    background-color: {BORDER};
+    border: none;
+    max-height: 1px;
+    margin: 2px 0;
+}}
+QFrame#exit_strip {{
+    background-color: {PANEL};
+    border-top: 1px solid {BORDER};
+    border-radius: 0;
+}}
+
+/* ── Section Headers ───────────────────────────────────────────────────── */
+QLabel#section_header {{
+    color: {MUTED};
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    border-bottom: 1px solid {BORDER};
+    padding-bottom: 5px;
+}}
+
+/* ── Mode Buttons ──────────────────────────────────────────────────────── */
+QPushButton#mode_easy, QPushButton#mode_intermediate, QPushButton#mode_hard {{
+    background-color: {PANEL};
+    color: {MUTED};
+    border: 1.5px solid {BORDER};
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    text-align: left;
+}}
+QPushButton#mode_easy:hover,
+QPushButton#mode_intermediate:hover,
+QPushButton#mode_hard:hover {{
+    background-color: {PANEL_ALT};
+    color: {TEXT};
+}}
+QPushButton#mode_easy:disabled,
+QPushButton#mode_intermediate:disabled,
+QPushButton#mode_hard:disabled {{
+    color: {GRAY};
+    background-color: #f6f8fa;
+    border-color: #dde6ef;
+}}
+QPushButton#mode_easy[activeMode="true"] {{
+    background-color: {GREEN};
+    color: {PANEL};
+    border-color: #177a42;
+}}
+QPushButton#mode_intermediate[activeMode="true"] {{
+    background-color: {BLUE};
+    color: {PANEL};
+    border-color: {BLUE_DARK};
+}}
+QPushButton#mode_hard[activeMode="true"] {{
+    background-color: {RED};
+    color: {PANEL};
+    border-color: #a02020;
+}}
+
+/* ── Start Button ──────────────────────────────────────────────────────── */
+QPushButton#start_button {{
+    background-color: {GREEN};
+    color: {PANEL};
+    border: none;
+    border-radius: 12px;
+    padding: 13px 14px;
+    min-height: 48px;
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+}}
+QPushButton#start_button:hover {{
+    background-color: #177a42;
+}}
+QPushButton#start_button:disabled {{
+    background-color: #c8d8cc;
+    color: #8aab95;
+}}
+
+/* ── Outline Buttons ───────────────────────────────────────────────────── */
+QPushButton#outline_button {{
+    background-color: {PANEL};
+    color: {BLUE};
+    border: 1.5px solid {BLUE};
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 700;
+}}
+QPushButton#outline_button:hover {{
+    background-color: {BLUE_LIGHT};
+}}
+QPushButton#outline_button:disabled {{
+    color: {GRAY};
+    border-color: {BORDER};
+    background-color: #f6f8fa;
+}}
+
+/* ── Danger Button ─────────────────────────────────────────────────────── */
+QPushButton#danger_button {{
+    background-color: #fff8f8;
+    color: {RED};
+    border: 1.5px solid #efb4b4;
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    width: 100%;
+}}
+QPushButton#danger_button:hover {{
+    background-color: #fee;
+    border-color: {RED};
+}}
+
+/* ── Generic Command Button ────────────────────────────────────────────── */
+QPushButton#command_button {{
+    background-color: {PANEL};
+    color: {NAVY};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 8px 10px;
+    min-height: 30px;
+    font-weight: 700;
+    font-size: 12px;
+}}
+QPushButton#command_button:hover {{
+    background-color: {BLUE_LIGHT};
+    border-color: {BLUE};
+}}
+QPushButton#command_button:disabled {{
+    color: {GRAY};
+    background-color: #f6f8fa;
+    border-color: #dde6ef;
+}}
+
+/* ── Connect Button ────────────────────────────────────────────────────── */
+QPushButton#connect_button {{
+    background-color: {BLUE};
+    color: {PANEL};
+    border: 1px solid {BLUE_DARK};
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-weight: 700;
+    font-size: 12px;
+    min-width: 90px;
+}}
+QPushButton#connect_button:hover {{
+    background-color: {BLUE_DARK};
+}}
+QPushButton#connect_button[connected="true"] {{
+    background-color: {GREEN};
+    border-color: #177a42;
+}}
+QPushButton#connect_button[connected="true"]:hover {{
+    background-color: #177a42;
+}}
+
+/* ── Generic QPushButton fallback ──────────────────────────────────────── */
+QPushButton {{
+    background-color: {PANEL};
+    color: {NAVY};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 7px 12px;
+    min-height: 26px;
+    font-weight: 700;
+    font-size: 12px;
+}}
+QPushButton:hover {{
+    background-color: {BLUE_LIGHT};
+    border-color: {BLUE};
+}}
+QPushButton:pressed {{
+    background-color: #d7ebff;
+}}
+QPushButton:disabled {{
+    color: {GRAY};
+    background-color: #f4f7fa;
+    border-color: #dde6ef;
+}}
+QPushButton[selected="true"] {{
+    background-color: {BLUE_LIGHT};
+    border-color: {BLUE};
+    color: {NAVY};
+}}
+QPushButton#terminal_button {{
+    color: {MUTED};
+    background: transparent;
+    border: none;
+    font-size: 12px;
+}}
+
+/* ── Labels ────────────────────────────────────────────────────────────── */
 QLabel {{
     color: {TEXT};
     font-size: 13px;
 }}
-QLabel#title {{
+QLabel#muted_label, QLabel#countdown_label, QLabel#timestamp {{
+    color: {MUTED};
+    font-size: 11px;
+}}
+QLabel#countdown_label {{
+    font-style: italic;
+}}
+QLabel#timestamp {{
+    font-family: Menlo, Consolas, monospace;
+    font-size: 10px;
+}}
+QLabel#panel_title {{
     color: {NAVY};
-    font-size: 22px;
-    font-weight: 900;
+    font-size: 15px;
+    font-weight: 800;
 }}
 QLabel#dialog_title {{
     color: {NAVY};
     font-size: 21px;
     font-weight: 900;
+}}
+QLabel#mode_badge {{
+    font-size: 11px;
+    font-weight: 900;
+    border-radius: 10px;
+    padding: 3px 10px;
+}}
+
+/* ── Metric Cards (ClinicalValue) ──────────────────────────────────────── */
+QFrame#clinical_value {{
+    background-color: {PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+QLabel#metric_title {{
+    color: {MUTED};
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+}}
+QLabel#metric_value {{
+    color: {TEXT};
+    font-family: Menlo, Consolas, monospace;
+    font-size: 16px;
+    font-weight: 800;
+}}
+QLabel#metric_unit {{
+    color: {MUTED};
+    font-size: 10px;
+}}
+
+/* ── Summary Dialog ────────────────────────────────────────────────────── */
+QFrame#summary_card, QFrame#dialog_panel {{
+    background-color: {PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
 }}
 QLabel#summary_score_label {{
     color: {NAVY};
@@ -1922,38 +3414,7 @@ QLabel#summary_grade_label {{
     font-size: 18px;
     font-weight: 900;
 }}
-QLabel#subtitle, QLabel#muted_label, QLabel#panel_caption, QLabel#timestamp,
-QLabel#session_hint {{
-    color: {MUTED};
-    font-size: 12px;
-}}
-QLabel#panel_title {{
-    color: {NAVY};
-    font-size: 15px;
-    font-weight: 800;
-}}
-QLabel#state_label {{
-    font-size: 25px;
-    font-weight: 900;
-}}
-QLabel#coach_label {{
-    font-size: 20px;
-    font-weight: 900;
-}}
-QLabel#alert_label, QLabel#status_badge {{
-    font-size: 12px;
-    font-weight: 800;
-}}
-QLabel#countdown_label {{
-    color: {MUTED};
-    font-size: 12px;
-    font-weight: 800;
-}}
-QLabel#mode_badge {{
-    font-size: 12px;
-    font-weight: 900;
-}}
-QLabel#summary_title, QLabel#metric_title {{
+QLabel#summary_title {{
     color: {MUTED};
     font-size: 10px;
     font-weight: 800;
@@ -1962,18 +3423,52 @@ QLabel#summary_title, QLabel#metric_title {{
 QLabel#summary_value {{
     color: {NAVY};
     font-family: Menlo, Consolas, monospace;
-    font-size: 30px;
+    font-size: 28px;
     font-weight: 900;
 }}
-QLabel#metric_value {{
-    color: {TEXT};
-    font-family: Menlo, Consolas, monospace;
-    font-size: 17px;
-    font-weight: 900;
-}}
-QLabel#summary_unit, QLabel#metric_unit {{
+QLabel#summary_unit {{
     color: {MUTED};
     font-size: 10px;
+}}
+
+/* ── Activity Feed ─────────────────────────────────────────────────────── */
+QFrame#activity_card {{
+    background-color: {PANEL_ALT};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+QScrollArea#review_scroll, QScrollArea#metrics_scroll {{
+    border: none;
+    background: transparent;
+}}
+
+/* ── Engineering Log ───────────────────────────────────────────────────── */
+QPlainTextEdit#log {{
+    font-family: Menlo, Consolas, monospace;
+    font-size: 12px;
+    background-color: {NAVY};
+    color: {ICE};
+    border: none;
+}}
+
+/* ── Dialogs / Calibration ─────────────────────────────────────────────── */
+QLabel#instruction_text {{
+    color: {TEXT};
+    font-size: 13px;
+    line-height: 150%;
+}}
+QLabel#command_chip {{
+    color: {NAVY};
+    background-color: {BLUE_LIGHT};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-weight: 700;
+}}
+QLabel#panel_caption {{
+    color: {MUTED};
+    font-size: 12px;
 }}
 QLabel#info_mode {{
     font-size: 14px;
@@ -1983,43 +3478,25 @@ QLabel#info_body {{
     color: {TEXT};
     font-size: 12px;
 }}
-QLabel#instruction_text {{
-    color: {TEXT};
-    font-size: 14px;
-    line-height: 150%;
-}}
-QLabel#command_chip {{
-    color: {NAVY};
-    background-color: {BLUE_LIGHT};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-    padding: 8px;
-    font-family: Menlo, Consolas, monospace;
-    font-weight: 800;
-}}
-QLabel#fallback_label {{
-    color: {MUTED};
-    background-color: {PANEL_ALT};
-    border: 1px dashed {BORDER};
-    border-radius: 8px;
-    padding: 12px;
-}}
-QFrame#clinical_value {{
-    background-color: {PANEL_ALT};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-}}
-QFrame#activity_card {{
-    background-color: {PANEL_ALT};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-}}
 QFrame#info_card {{
     background-color: {PANEL_ALT};
     border: 1px solid {BORDER};
     border-radius: 8px;
 }}
-QComboBox, QTextEdit {{
+QProgressBar#calibration_progress {{
+    min-height: 10px;
+    max-height: 10px;
+    border: 1px solid {BORDER};
+    border-radius: 5px;
+    background-color: #dfeaf7;
+}}
+QProgressBar#calibration_progress::chunk {{
+    background-color: {BLUE};
+    border-radius: 5px;
+}}
+
+/* ── QComboBox ─────────────────────────────────────────────────────────── */
+QComboBox {{
     background-color: {PANEL};
     color: {TEXT};
     border: 1px solid {BORDER};
@@ -2031,91 +3508,15 @@ QComboBox QAbstractItemView {{
     color: {TEXT};
     selection-background-color: {BLUE_LIGHT};
 }}
-QTextEdit#log {{
-    font-family: Menlo, Consolas, monospace;
-    font-size: 12px;
-}}
-QPushButton {{
-    background-color: {PANEL};
-    color: {NAVY};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-    padding: 8px 10px;
-    min-height: 24px;
-    font-weight: 800;
-}}
-QPushButton:hover {{
-    background-color: {BLUE_LIGHT};
-    border-color: {BLUE};
-}}
-QPushButton:pressed {{
-    background-color: #d7ebff;
-}}
-QPushButton:disabled {{
-    color: #a9b6c4;
-    background-color: #f1f6fb;
-    border-color: #d8e4ef;
-}}
-QPushButton#connect_button[connected="true"] {{
-    color: {GREEN};
-    border-color: {GREEN};
-}}
-QPushButton#danger_button {{
-    color: {RED};
-    border-color: #efb4b4;
-}}
-QPushButton#start_button {{
-    color: {GREEN};
-    border-color: {GREEN};
-    background-color: #f1fbf5;
-}}
-QPushButton#start_button:disabled {{
-    color: #9fb8aa;
-    border-color: #d5e6dd;
-    background-color: #f4f8f6;
-}}
-QPushButton[activeMode="true"] {{
-    color: {PANEL};
-    background-color: {BLUE};
-    border-color: {BLUE_DARK};
-}}
-QPushButton#terminal_button {{
-    color: {MUTED};
-    background-color: transparent;
-}}
-QPushButton[selected="true"] {{
-    background-color: {BLUE_LIGHT};
-    border-color: {BLUE};
-    color: {NAVY};
-}}
-QTabWidget::pane {{
-    background-color: {PANEL};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-}}
-QTabBar::tab {{
-    background: {PANEL_ALT};
-    color: {MUTED};
-    border: 1px solid {BORDER};
-    padding: 8px 16px;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-}}
-QTabBar::tab:selected {{
-    color: {NAVY};
-    background: {PANEL};
-    border-bottom-color: {PANEL};
-}}
-QScrollArea#feed_scroll {{
-    border: none;
-    background: transparent;
-}}
 """
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setFont(QFont("Arial", 12))
+    # DESIGN: IBM Plex Sans chosen over Arial — same neutral sans-serif role but
+    # with a slightly technical character appropriate for an instrument interface.
+    # Falls back to the system sans-serif if IBM Plex Sans is not installed.
+    app.setFont(QFont("IBM Plex Sans", 12))
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
     window.show()

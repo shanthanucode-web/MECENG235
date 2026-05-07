@@ -12,21 +12,38 @@ static const char *NVS_KEY = "cal_params";
 esp_err_t nvs_load_calibration(cal_params_t *out)
 {
     nvs_handle_t h;
-    esp_err_t ret = nvs_open(NVS_NS, NVS_READONLY, &h);
+    esp_err_t ret = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    size_t sz = sizeof(cal_params_t);
-    ret = nvs_get_blob(h, NVS_KEY, out, &sz);
-    nvs_close(h);
+    size_t sz = 0;
+    ret = nvs_get_blob(h, NVS_KEY, NULL, &sz);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(h);
+        return ret;
+    }
+    if (ret != ESP_OK) {
+        nvs_close(h);
+        return ret;
+    }
 
-    if (ret == ESP_OK && sz != sizeof(cal_params_t)) {
-        /* Struct layout changed — treat as missing */
-        ESP_LOGW(TAG, "NVS blob size mismatch (%u vs %u), ignoring",
+    if (sz != sizeof(cal_params_t)) {
+        ESP_LOGW(TAG, "NVS blob size mismatch (%u vs %u), erasing stale calibration",
                  (unsigned)sz, (unsigned)sizeof(cal_params_t));
+        esp_err_t erase_ret = nvs_erase_key(h, NVS_KEY);
+        if (erase_ret == ESP_OK || erase_ret == ESP_ERR_NVS_NOT_FOUND) {
+            erase_ret = nvs_commit(h);
+        }
+        if (erase_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to erase stale calibration blob: %s", esp_err_to_name(erase_ret));
+        }
+        nvs_close(h);
         return ESP_ERR_NVS_NOT_FOUND;
     }
+
+    ret = nvs_get_blob(h, NVS_KEY, out, &sz);
+    nvs_close(h);
     return ret;
 }
 
@@ -89,5 +106,13 @@ void nvs_get_defaults(cal_params_t *out)
     out->f95_ref      = 4.8f;   /* Hz */
     out->pp_roll_ref  = 30.0f;  /* deg */
     out->pp_pitch_ref = 20.0f;  /* deg */
+    out->motion_rms_ref = 12.0f;          /* deg/s */
+    out->motion_tremor_ratio_ref = 0.25f; /* unitless */
+    out->yaw_right_ref = 24.0f; /* deg */
+    out->yaw_left_ref  = 24.0f; /* deg */
+    out->pitch_fwd_ref = 18.0f; /* deg */
+    out->pitch_back_ref = 18.0f; /* deg */
     out->tremor_rms_ref = TREMOR_BASELINE_FLOOR_DPS;
+    out->yaw_axis_index = -1;
+    out->pitch_axis_index = -1;
 }

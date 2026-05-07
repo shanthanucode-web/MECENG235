@@ -72,12 +72,39 @@ typedef struct {
     float off_thresh[3];   /* contact-OFF threshold = max(0.15, mu[i] + 3*sigma[i]) */
     float gyro_bias[3];    /* gyroscope DC bias in deg/s */
     float q_neutral[4];    /* quaternion at neutral rest pose: w, x, y, z */
+    float euler_neutral[3];/* neutral roll, pitch, yaw in degrees */
     float f_ref_open;      /* open-grip FSR reference (N), from C3 calibration */
     float f95_ref;         /* 95% power frequency reference (Hz) */
     float pp_roll_ref;     /* peak-to-peak roll reference (deg) */
     float pp_pitch_ref;    /* peak-to-peak pitch reference (deg) */
+    float motion_rms_ref;  /* broadband angular-speed RMS during normal hand motion (deg/s) */
+    float motion_tremor_ratio_ref; /* 6-12 Hz tremor-band fraction during normal hand motion */
+    float yaw_right_ref;   /* peak yaw excursion to the right (deg, magnitude) */
+    float yaw_left_ref;    /* peak yaw excursion to the left (deg, magnitude) */
+    float pitch_fwd_ref;   /* peak forward pitch excursion (deg, magnitude) */
+    float pitch_back_ref;  /* peak backward pitch excursion (deg, magnitude) */
     float tremor_rms_ref;  /* no-motion 6-12 Hz gyro RMS baseline from C1 (deg/s) */
+    float c3_stage_peak[6];
+    float c3_stage_mean_force[6];
+    float c3_stage_f95[6];
+    float c3_stage_pp_roll[6];
+    float c3_stage_pp_pitch[6];
+    float c3_stage_target[6][3];
+    float c3_stage_return_center[6][3];
+    uint32_t c3_stage_mask;
+    int8_t yaw_axis_index;
+    int8_t yaw_sign;
+    int8_t pitch_axis_index;
+    int8_t pitch_sign;
 } cal_params_t;
+
+#define C3_STAGE_BIT_YAW_RIGHT      (1u << 0)
+#define C3_STAGE_BIT_YAW_LEFT       (1u << 1)
+#define C3_STAGE_BIT_PITCH_FORWARD  (1u << 2)
+#define C3_STAGE_BIT_PITCH_BACK     (1u << 3)
+#define C3_STAGE_BIT_FIG8_A         (1u << 4)
+#define C3_STAGE_BIT_FIG8_B         (1u << 5)
+#define C3_STAGE_BIT_ALL            ((1u << 6) - 1u)
 
 /* ── Clinical force thresholds (Horeman et al. 2010) ────────────────────── */
 /* Expert mean force: 0.9 N (Horeman et al. 2010)                           */
@@ -99,14 +126,30 @@ typedef struct {
 #define FORCE_HARD_WARN_X   1.5f
 #define FORCE_HARD_ERR_X    2.5f
 
-/* Tremor mode thresholds. Values are applied above the C1 no-motion baseline. */
-#define TREMOR_EASY_WARN_DPS   18.0f
-#define TREMOR_EASY_ERR_DPS    28.0f
-#define TREMOR_MED_WARN_DPS    12.0f
-#define TREMOR_MED_ERR_DPS     20.0f
-#define TREMOR_HARD_WARN_DPS    8.0f
-#define TREMOR_HARD_ERR_DPS    14.0f
+/* Tremor thresholds:
+ * - EXCESS_DPS is 6-12 Hz gyro RMS above the C1 no-motion baseline.
+ * - RATIO is the fraction of total motion that sits in the tremor band.
+ * A live tremor warning requires both amplitude and ratio to exceed threshold. */
+#define TREMOR_EASY_WARN_EXCESS_DPS   4.0f
+#define TREMOR_EASY_ERR_EXCESS_DPS    6.0f
+#define TREMOR_MED_WARN_EXCESS_DPS    3.0f
+#define TREMOR_MED_ERR_EXCESS_DPS     5.0f
+#define TREMOR_HARD_WARN_EXCESS_DPS   2.0f
+#define TREMOR_HARD_ERR_EXCESS_DPS    3.5f
+
+#define TREMOR_EASY_WARN_RATIO   0.50f
+#define TREMOR_EASY_ERR_RATIO    0.70f
+#define TREMOR_MED_WARN_RATIO    0.40f
+#define TREMOR_MED_ERR_RATIO     0.60f
+#define TREMOR_HARD_WARN_RATIO   0.30f
+#define TREMOR_HARD_ERR_RATIO    0.50f
+
 #define TREMOR_BASELINE_FLOOR_DPS  3.0f
+#define TREMOR_RATIO_FLOOR_DPS     1.0f
+
+/* Swing detection uses signed dominant-axis gyro reversals with a deadband. */
+#define SWING_SIGN_DEADBAND_DPS    2.0f
+#define SWING_WARN_RATE_HZ         2.0f
 
 /* ── Warning / error bitmasks ────────────────────────────────────────────── */
 #define WARN_HOLD_INSTABILITY   (1u << 0)

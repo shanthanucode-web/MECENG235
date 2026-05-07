@@ -61,3 +61,10 @@ void processing_task(void *arg);
  */
 void processing_tremor_baseline_reset(void);
 float processing_tremor_baseline_step(const float gyro_dps[3]);
+
+/*
+ * Shared smoothness helper used by both runtime scoring and calibration.
+ * Expects a 100 Hz window of angular-speed magnitudes.
+ * Returns the frequency (Hz) below which 95% of the window power sits.
+ */
+float processing_compute_f95_window(const float *omega_window, int n);

@@ -48,16 +48,21 @@ static uint8_t s_off_cnt[3];
 /* ── Board / state machine ───────────────────────────────────────────── */
 static board_state_t s_state     = BOARD_IDLE;
 static int           s_hold_cnt  = 0;
+static bool          s_imu_fallback_engaged = false;
+static int           s_imu_gate_on_cnt = 0;
+static int           s_imu_gate_off_cnt = 0;
 
 /* ── Sliding windows for threshold calculations ───────────────────────── */
 #define WIN_250MS   25   /* 250 ms at 100 Hz */
 #define WIN_1S     100   /* 1 s at 100 Hz */
+#define IMU_GATE_ON_SAMPLES   15   /* 150 ms */
+#define IMU_GATE_OFF_SAMPLES  25   /* 250 ms */
 
 static float  s_omega_win[WIN_250MS];
 static float  s_fsig_win[WIN_250MS];
 static float  s_roll_win[WIN_250MS];
 static float  s_pitch_win[WIN_250MS];
-static float  s_omega_1s[WIN_1S];
+static float  s_gyro_axis_1s[3][WIN_1S];
 static float  s_bp_omega_win[WIN_250MS]; /* bandpass-filtered omega_norm */
 static int    s_win_idx   = 0;
 static int    s_win_1s_idx = 0;
@@ -80,8 +85,10 @@ static float s_actual_hz = 100.0f;
 /* ── Active force thresholds (updated by E/M/H commands) ─────────────── */
 static float s_warn_sum_n = FORCE_WARN_SUM_N;  /* 2.0 N default (medium) */
 static float s_err_sum_n  = FORCE_ERR_SUM_N;   /* 4.0 N default (medium) */
-static float s_warn_tremor_dps = TREMOR_MED_WARN_DPS;
-static float s_err_tremor_dps  = TREMOR_MED_ERR_DPS;
+static float s_warn_tremor_excess_dps = TREMOR_MED_WARN_EXCESS_DPS;
+static float s_err_tremor_excess_dps  = TREMOR_MED_ERR_EXCESS_DPS;
+static float s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
+static float s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
 
 /* ── Sustained error counters for force compression ──────────────────── */
 static int s_warn_force_dur_cnt = 0;
@@ -96,11 +103,33 @@ static void reset_session_metrics(void)
     s_score = 100.0f;
     s_state = BOARD_IDLE;
     s_hold_cnt = 0;
+    s_imu_fallback_engaged = false;
+    s_imu_gate_on_cnt = 0;
+    s_imu_gate_off_cnt = 0;
     s_warn_force_dur_cnt = 0;
     s_err_force_dur_cnt = 0;
     memset(s_contact, 0, sizeof(s_contact));
     memset(s_on_cnt, 0, sizeof(s_on_cnt));
     memset(s_off_cnt, 0, sizeof(s_off_cnt));
+    memset(s_omega_win, 0, sizeof(s_omega_win));
+    memset(s_fsig_win, 0, sizeof(s_fsig_win));
+    memset(s_roll_win, 0, sizeof(s_roll_win));
+    memset(s_pitch_win, 0, sizeof(s_pitch_win));
+    memset(s_gyro_axis_1s, 0, sizeof(s_gyro_axis_1s));
+    memset(s_bp_omega_win, 0, sizeof(s_bp_omega_win));
+    memset(s_omega_dft_buf, 0, sizeof(s_omega_dft_buf));
+    s_win_idx = 0;
+    s_win_1s_idx = 0;
+    s_win_filled = 0;
+    s_win_1s_filled = 0;
+    s_fft_idx = 0;
+    s_fft_filled = 0;
+    for (int i = 0; i < 3; i++) {
+        filter_lp_10hz_init(&s_lp_fsr[i]);
+        filter_lp_12hz_init(&s_lp_omega[i]);
+        filter_bp_6_12hz_init(&s_bp_tremor[i]);
+    }
+    filter_diff5_init(&s_diff5_fsr);
 }
 
 static float tremor_baseline_dps(void)
@@ -110,6 +139,27 @@ static float tremor_baseline_dps(void)
         baseline = TREMOR_BASELINE_FLOOR_DPS;
     }
     return baseline;
+}
+
+static float motion_tremor_ratio_baseline(void)
+{
+    float baseline = s_cal->motion_tremor_ratio_ref;
+    if (baseline < 0.0f) {
+        baseline = 0.0f;
+    }
+    return baseline;
+}
+
+static float tremor_warn_ratio_threshold(void)
+{
+    float learned = motion_tremor_ratio_baseline() + 0.10f;
+    return (learned > s_warn_tremor_ratio) ? learned : s_warn_tremor_ratio;
+}
+
+static float tremor_err_ratio_threshold(void)
+{
+    float learned = motion_tremor_ratio_baseline() + 0.20f;
+    return (learned > s_err_tremor_ratio) ? learned : s_err_tremor_ratio;
 }
 
 static float window_rms(const float *w, int n)
@@ -159,19 +209,67 @@ static float window_max(const float *w, int n)
     return mx;
 }
 
+static float compute_swing_rate(void)
+{
+    int wn1s = s_win_1s_filled;
+    if (wn1s <= 1) {
+        return 0.0f;
+    }
+
+    int start = (wn1s < WIN_1S) ? 0 : s_win_1s_idx;
+    float mean_abs[3] = {0.0f, 0.0f, 0.0f};
+    for (int axis = 0; axis < 3; axis++) {
+        for (int i = 0; i < wn1s; i++) {
+            int idx = (start + i) % WIN_1S;
+            mean_abs[axis] += fabsf(s_gyro_axis_1s[axis][idx]);
+        }
+        mean_abs[axis] /= (float)wn1s;
+    }
+
+    int dominant_axis = 0;
+    if (mean_abs[1] > mean_abs[dominant_axis]) {
+        dominant_axis = 1;
+    }
+    if (mean_abs[2] > mean_abs[dominant_axis]) {
+        dominant_axis = 2;
+    }
+
+    int sign_changes = 0;
+    int prev_sign = 0;
+    for (int i = 0; i < wn1s; i++) {
+        int idx = (start + i) % WIN_1S;
+        float sample = s_gyro_axis_1s[dominant_axis][idx];
+        int sign = 0;
+        if (sample > SWING_SIGN_DEADBAND_DPS) {
+            sign = 1;
+        } else if (sample < -SWING_SIGN_DEADBAND_DPS) {
+            sign = -1;
+        }
+        if (sign == 0) {
+            continue;
+        }
+        if (prev_sign != 0 && sign != prev_sign) {
+            sign_changes++;
+        }
+        prev_sign = sign;
+    }
+
+    return (float)sign_changes / ((float)wn1s / (float)SAMPLE_RATE_HZ);
+}
+
 /* ── Compute f95_omega via real DFT (no external library) ────────────── */
 /*
  * DFT_BINS bins from 0 to (DFT_BINS-1) × freq_res cover 0–18.75 Hz at 100 Hz / 64.
  * O(N·K) = 64 × 13 = 832 multiplies — well within 10 ms processing budget.
  */
-static float compute_f95(void)
+float processing_compute_f95_window(const float *omega_window, int n)
 {
-    /* Re-order circular buffer into a contiguous sequence */
-    float x[DFT_N];
-    for (int i = 0; i < DFT_N; i++) {
-        x[i] = s_omega_dft_buf[(s_fft_idx + i) % DFT_N];
+    if (omega_window == NULL || n < DFT_N) {
+        return 0.0f;
     }
 
+    const float *x = &omega_window[n - DFT_N];
+    /* Re-order circular buffer into a contiguous sequence */
     float power[DFT_BINS];
     float total_power = 0.0f;
     float freq_res = (float)SAMPLE_RATE_HZ / (float)DFT_N; /* 1.5625 Hz/bin */
@@ -200,6 +298,15 @@ static float compute_f95(void)
         }
     }
     return (float)(DFT_BINS - 1) * freq_res;
+}
+
+static float compute_f95(void)
+{
+    float x[DFT_N];
+    for (int i = 0; i < DFT_N; i++) {
+        x[i] = s_omega_dft_buf[(s_fft_idx + i) % DFT_N];
+    }
+    return processing_compute_f95_window(x, DFT_N);
 }
 
 /* ── Contact detection (per finger) ──────────────────────────────────── */
@@ -254,6 +361,7 @@ static void dispatch_command(const char *cmd, int len)
     case 'I':
         led_status_solid_on();
         uart_write_bytes(UART_NUM_0, "ESP32_TRAINER\r\n", 15);
+        uart_write_bytes(UART_NUM_0, "READY: fw=v1.0 proto=cal-v3\r\n", 31);
         break;
     case 'S':
         led_status_off();
@@ -266,8 +374,10 @@ static void dispatch_command(const char *cmd, int len)
         reset_session_metrics();
         s_warn_sum_n = s_cal->f_ref_open * FORCE_EASY_WARN_X;
         s_err_sum_n  = s_cal->f_ref_open * FORCE_EASY_ERR_X;
-        s_warn_tremor_dps = TREMOR_EASY_WARN_DPS;
-        s_err_tremor_dps  = TREMOR_EASY_ERR_DPS;
+        s_warn_tremor_excess_dps = TREMOR_EASY_WARN_EXCESS_DPS;
+        s_err_tremor_excess_dps  = TREMOR_EASY_ERR_EXCESS_DPS;
+        s_warn_tremor_ratio = TREMOR_EASY_WARN_RATIO;
+        s_err_tremor_ratio  = TREMOR_EASY_ERR_RATIO;
         uart_write_bytes(UART_NUM_0, "EASY\r\n", 6);
         break;
     case 'M':
@@ -275,8 +385,10 @@ static void dispatch_command(const char *cmd, int len)
         reset_session_metrics();
         s_warn_sum_n = s_cal->f_ref_open * FORCE_MED_WARN_X;
         s_err_sum_n  = s_cal->f_ref_open * FORCE_MED_ERR_X;
-        s_warn_tremor_dps = TREMOR_MED_WARN_DPS;
-        s_err_tremor_dps  = TREMOR_MED_ERR_DPS;
+        s_warn_tremor_excess_dps = TREMOR_MED_WARN_EXCESS_DPS;
+        s_err_tremor_excess_dps  = TREMOR_MED_ERR_EXCESS_DPS;
+        s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
+        s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
         uart_write_bytes(UART_NUM_0, "INTERMEDIATE\r\n", 14);
         break;
     case 'H':
@@ -284,8 +396,10 @@ static void dispatch_command(const char *cmd, int len)
         reset_session_metrics();
         s_warn_sum_n = s_cal->f_ref_open * FORCE_HARD_WARN_X;
         s_err_sum_n  = s_cal->f_ref_open * FORCE_HARD_ERR_X;
-        s_warn_tremor_dps = TREMOR_HARD_WARN_DPS;
-        s_err_tremor_dps  = TREMOR_HARD_ERR_DPS;
+        s_warn_tremor_excess_dps = TREMOR_HARD_WARN_EXCESS_DPS;
+        s_err_tremor_excess_dps  = TREMOR_HARD_ERR_EXCESS_DPS;
+        s_warn_tremor_ratio = TREMOR_HARD_WARN_RATIO;
+        s_err_tremor_ratio  = TREMOR_HARD_ERR_RATIO;
         uart_write_bytes(UART_NUM_0, "HARD\r\n", 6);
         break;
     case 'X':
@@ -338,15 +452,17 @@ void processing_init(QueueHandle_t raw_q,
     memset(s_fsig_win,  0, sizeof(s_fsig_win));
     memset(s_roll_win,  0, sizeof(s_roll_win));
     memset(s_pitch_win, 0, sizeof(s_pitch_win));
-    memset(s_omega_1s,  0, sizeof(s_omega_1s));
+    memset(s_gyro_axis_1s,  0, sizeof(s_gyro_axis_1s));
 
     /* No external FFT library required — DFT is self-contained */
 
     /* Initialise force thresholds to medium (default) mode */
     s_warn_sum_n = FORCE_WARN_SUM_N;
     s_err_sum_n  = FORCE_ERR_SUM_N;
-    s_warn_tremor_dps = TREMOR_MED_WARN_DPS;
-    s_err_tremor_dps  = TREMOR_MED_ERR_DPS;
+    s_warn_tremor_excess_dps = TREMOR_MED_WARN_EXCESS_DPS;
+    s_err_tremor_excess_dps  = TREMOR_MED_ERR_EXCESS_DPS;
+    s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
+    s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
 
 }
 
@@ -442,7 +558,9 @@ void processing_task(void *arg)
         s_win_idx = (s_win_idx + 1) % WIN_250MS;
         if (s_win_filled < WIN_250MS) s_win_filled++;
 
-        s_omega_1s[s_win_1s_idx] = omega_norm;
+        for (int i = 0; i < 3; i++) {
+            s_gyro_axis_1s[i][s_win_1s_idx] = omega_f[i];
+        }
         s_win_1s_idx = (s_win_1s_idx + 1) % WIN_1S;
         if (s_win_1s_filled < WIN_1S) s_win_1s_filled++;
 
@@ -454,26 +572,19 @@ void processing_task(void *arg)
         /* ── 4. Derived features ───────────────────────────────────── */
         int wn = s_win_filled;
 
-        /* Tremor ratio: variance of bandpass / variance of omega */
-        float var_bp    = 0.0f, var_omega = 0.0f;
-        float mean_bp   = window_mean(s_bp_omega_win, wn);
-        float mean_omega = window_mean(s_omega_win, wn);
-        for (int i = 0; i < wn; i++) {
-            float d1 = s_bp_omega_win[i] - mean_bp;
-            float d2 = s_omega_win[i]    - mean_omega;
-            var_bp    += d1 * d1;
-            var_omega += d2 * d2;
-        }
-        float tremor_ratio = (var_omega > 1e-9f) ? (var_bp / var_omega) : 0.0f;
+        float omega_rms_250 = window_rms(s_omega_win, wn);
         float tremor_rms   = window_rms(s_bp_omega_win, wn);
+        float tremor_ratio = tremor_rms / fmaxf(omega_rms_250, TREMOR_RATIO_FLOOR_DPS);
         float tremor_excess_dps = tremor_rms - tremor_baseline_dps();
+        float warn_tremor_ratio_thresh = tremor_warn_ratio_threshold();
+        float err_tremor_ratio_thresh = tremor_err_ratio_threshold();
         if (tremor_excess_dps < 0.0f) {
             tremor_excess_dps = 0.0f;
         }
-        float tremor_index = tremor_excess_dps / s_warn_tremor_dps;
-        if (tremor_ratio > 0.80f && tremor_index < 1.0f) {
-            tremor_index = 1.0f;
-        }
+        float tremor_index_amp   = tremor_excess_dps / s_warn_tremor_excess_dps;
+        float tremor_index_ratio = tremor_ratio / warn_tremor_ratio_thresh;
+        float tremor_index = (tremor_index_amp > tremor_index_ratio) ?
+                             tremor_index_amp : tremor_index_ratio;
 
         /* f95 — only meaningful once FFT buffer is full */
         float f95 = (s_fft_filled >= DFT_N) ? compute_f95() : 0.0f;
@@ -486,33 +597,54 @@ void processing_task(void *arg)
         float pp_roll  = (wn > 1) ? (window_max(s_roll_win,  wn) - window_min(s_roll_win,  wn)) : 0.0f;
         float pp_pitch = (wn > 1) ? (window_max(s_pitch_win, wn) - window_min(s_pitch_win, wn)) : 0.0f;
 
-        /* Swing rate: sign changes of dominant gyro axis per second (in 1s window) */
-        float swing_rate = 0.0f;
-        {
-            int wn1s = s_win_1s_filled;
-            int sign_changes = 0;
-            if (wn1s > 1) {
-                float prev = s_omega_1s[0];
-                for (int i = 1; i < wn1s; i++) {
-                    if ((s_omega_1s[i] > 0.0f) != (prev > 0.0f)) {
-                        sign_changes++;
-                    }
-                    prev = s_omega_1s[i];
-                }
-                swing_rate = (float)sign_changes / ((float)wn1s / (float)SAMPLE_RATE_HZ);
-            }
-        }
+        /* Swing rate: signed reversals of the dominant gyro axis per second. */
+        float swing_rate = compute_swing_rate();
 
         /* ── 5. Contact detection (per finger) ────────────────────── */
         for (int i = 0; i < 3; i++) {
             update_contact(i, fsr_f[i]);
         }
 
-        /* ── 6. State detection ────────────────────────────────────── */
+        /* ── 6. State detection / engagement gate ──────────────────── */
         bool any_contact = s_contact[0] || s_contact[1] || s_contact[2];
+        bool imu_gate_on_motion =
+            (omega_rms_250 > 2.5f) || (pp_roll > 4.0f) || (pp_pitch > 4.0f);
+        bool imu_gate_off_motion =
+            (omega_rms_250 < 1.5f) && (pp_roll < 2.0f) && (pp_pitch < 2.0f);
+
+        if (any_contact) {
+            s_imu_fallback_engaged = false;
+            s_imu_gate_on_cnt = 0;
+            s_imu_gate_off_cnt = 0;
+        } else if (wn >= WIN_250MS) {
+            if (!s_imu_fallback_engaged) {
+                if (imu_gate_on_motion) {
+                    if (++s_imu_gate_on_cnt >= IMU_GATE_ON_SAMPLES) {
+                        s_imu_fallback_engaged = true;
+                        s_imu_gate_on_cnt = 0;
+                        s_imu_gate_off_cnt = 0;
+                    }
+                } else {
+                    s_imu_gate_on_cnt = 0;
+                }
+            } else {
+                if (imu_gate_off_motion) {
+                    if (++s_imu_gate_off_cnt >= IMU_GATE_OFF_SAMPLES) {
+                        s_imu_fallback_engaged = false;
+                        s_imu_gate_on_cnt = 0;
+                        s_imu_gate_off_cnt = 0;
+                    }
+                } else {
+                    s_imu_gate_off_cnt = 0;
+                }
+            }
+        }
+        bool instrument_engaged = any_contact || s_imu_fallback_engaged;
+        const char *gate_str = any_contact ? "FSR" :
+                               s_imu_fallback_engaged ? "IMU" : "NONE";
 
         if (s_state != BOARD_EXITED) {
-            if (!any_contact) {
+            if (!instrument_engaged) {
                 s_state    = BOARD_IDLE;
                 s_hold_cnt = 0;
             } else if (omega_norm < 10.0f) {
@@ -535,16 +667,15 @@ void processing_task(void *arg)
         uint8_t err_flags  = 0;
 
         if (s_state == BOARD_HOLD && wn >= WIN_250MS) {
-            float rms_omega_250 = window_rms(s_omega_win, wn);
             float sd_roll       = window_stddev(s_roll_win, wn);
             float sd_pitch      = window_stddev(s_pitch_win, wn);
             float sd_max        = (sd_roll > sd_pitch) ? sd_roll : sd_pitch;
 
             /* Hold instability */
-            if (rms_omega_250 > 5.0f || sd_max > 2.0f) {
+            if (omega_rms_250 > 5.0f || sd_max > 2.0f) {
                 warn_flags |= WARN_HOLD_INSTABILITY;
             }
-            if (rms_omega_250 > 8.0f || sd_max > 3.0f) {
+            if (omega_rms_250 > 8.0f || sd_max > 3.0f) {
                 err_flags |= ERR_HOLD_INSTABILITY;
             }
 
@@ -555,26 +686,15 @@ void processing_task(void *arg)
             }
         }
 
-        if (s_state == BOARD_ACTIVE) {
-            /* Smoothness */
-            float f95_ref = s_cal->f95_ref;
-            if (f95 > 6.0f || f95 > 1.25f * f95_ref) {
-                warn_flags |= WARN_SMOOTHNESS;
-            }
-
-            /* Swing rate */
-            if (swing_rate > 2.0f) {
-                warn_flags |= WARN_SWING_RATE;
-            }
-        }
-
         /* Hand shaking / tremor: only score while the surgeon is actually
          * gripping the instrument, and scale tolerance by mode. */
-        if (any_contact && wn >= WIN_250MS) {
-            if (tremor_excess_dps > s_warn_tremor_dps) {
+        if (instrument_engaged && wn >= WIN_250MS) {
+            if (tremor_excess_dps > s_warn_tremor_excess_dps &&
+                tremor_ratio > warn_tremor_ratio_thresh) {
                 warn_flags |= WARN_TREMOR;
             }
-            if (tremor_excess_dps > s_err_tremor_dps) {
+            if (tremor_excess_dps > s_err_tremor_excess_dps &&
+                tremor_ratio > err_tremor_ratio_thresh) {
                 err_flags |= ERR_TREMOR;
             }
         }
@@ -653,6 +773,7 @@ void processing_task(void *arg)
                 ",\"pp_roll\":%.2f,\"pp_pitch\":%.2f"
                 ",\"cv_f\":%.3f,\"swing\":%.2f"
                 ",\"contact\":[%d,%d,%d]"
+                ",\"engaged\":%d,\"gate\":\"%s\""
                 ",\"state\":\"%s\""
                 ",\"warn\":%u,\"err\":%u"
                 ",\"score\":%.1f,\"actual_hz\":%.2f"
@@ -668,6 +789,7 @@ void processing_task(void *arg)
                 (double)pp_roll, (double)pp_pitch,
                 (double)cv_f, (double)swing_rate,
                 (int)s_contact[0], (int)s_contact[1], (int)s_contact[2],
+                instrument_engaged ? 1 : 0, gate_str,
                 state_str,
                 (unsigned)warn_flags, (unsigned)err_flags,
                 (double)s_score,

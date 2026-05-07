@@ -141,14 +141,14 @@ void app_main(void)
 
     xTaskCreatePinnedToCore(processing_task,
                             "proc_task",
-                            8192,   /* stack: DFT + IIR state + JSON buf */
+                            12288,  /* stack: processing pipeline + calibration workspace/logging margin */
                             NULL,
                             9,      /* priority */
                             NULL,
                             1);     /* ← Core 1 (APP CPU) */
 
     uart_write_bytes(UART_NUM_0, "System ready. Awaiting GUI connection...\r\n", 42);
-    uart_write_bytes(UART_NUM_0, "Commands>\r\n", 11);
+    uart_write_bytes(UART_NUM_0, "READY: fw=v1.0 proto=cal-v3\r\n", 31);
 
     /* app_main returns here.  The FreeRTOS scheduler takes over and runs
      * acq_task on Core 0 and proc_task on Core 1 independently and in
