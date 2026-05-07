@@ -1,285 +1,986 @@
-| Supported Targets | ESP32 |
-| ----------------- | ----- |
-
 # Haptic Surgical Skill Trainer — Lab 4
 
-ESP32 firmware and Python tools for the VitalSigns Lab 4 haptic surgical skill trainer.
-The system measures three-finger grip force via FSR 402 sensors, tracks hand motion via
-a BNO085 IMU, and streams live JSON telemetry to a host GUI at 20 Hz.
+ESP32 firmware and Python tools for a teaching-focused surgical skill trainer glove.
+The glove measures finger force with three FSR 402 sensors, measures hand motion with
+a BNO085 IMU, scores force and tremor behavior in real time, and streams live JSON
+telemetry to a desktop GUI.
+
+This README is intentionally written as both:
+
+- a normal project README, so you can build, flash, and run the system
+- a teaching guide, so you can understand how the code works well enough to modify it
+
+The project is implemented natively with ESP-IDF on the ESP32. It does not use Arduino.
 
 ---
 
-## Dual-Core Architecture
+## Table of Contents
 
-This is the most important design decision in the firmware. The ESP32 HUZZAH32 contains
-two independent Xtensa LX6 CPU cores running at 160 MHz. The firmware splits work across
-both cores so that sensor sampling is never interrupted by computation.
+1. [Project at a Glance](#project-at-a-glance)
+2. [Why This Project Exists](#why-this-project-exists)
+3. [System Overview](#system-overview)
+4. [Glossary](#glossary)
+5. [Hardware Guide](#hardware-guide)
+6. [Firmware Architecture](#firmware-architecture)
+7. [Real-Time Behavior](#real-time-behavior)
+8. [Multitasking Behavior](#multitasking-behavior)
+9. [Code Tour by Subsystem](#code-tour-by-subsystem)
+10. [Calibration Guide](#calibration-guide)
+11. [Scoring and Warning Logic](#scoring-and-warning-logic)
+12. [UART Protocol and Telemetry](#uart-protocol-and-telemetry)
+13. [GUI Guide](#gui-guide)
+14. [Build, Flash, and Run](#build-flash-and-run)
+15. [Diagnostic Tools](#diagnostic-tools)
+16. [How to Modify the Project](#how-to-modify-the-project)
+17. [Troubleshooting](#troubleshooting)
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         ESP32 HUZZAH32                              │
-│                                                                     │
-│   CORE 0 — PRO CPU (acquisition)                                    │
-│   ┌─────────────────────────────────────┐                           │
-│   │  esp_timer fires at 100 Hz          │                           │
-│   │    → gives s_timer_sem              │                           │
-│   │  acquisition_task wakes             │                           │
-│   │    → reads ADC (3× FSR 402)         │                           │
-│   │    → reads BNO085 UART-RVC if data  │                           │
-│   │    → packs raw_sample_t             │                           │
-│   │    → xQueueSend ─────────────────────┼──────────────────┐       │
-│   └─────────────────────────────────────┘                  │       │
-│                                                             │       │
-│                   FreeRTOS queue (10 × raw_sample_t)        │       │
-│                   — thread-safe cross-core FIFO             │       │
-│                                                             ▼       │
-│   CORE 1 — APP CPU (processing)                                     │
-│   ┌─────────────────────────────────────┐                           │
-│   │  processing_task blocks on          │                           │
-│   │    xQueueReceive (waits for data)   │                           │
-│   │    → Butterworth IIR filtering      │                           │
-│   │    → contact detection              │                           │
-│   │    → state machine (IDLE/HOLD/ACTIVE│                           │
-│   │    → 11 threshold checks            │                           │
-│   │    → motor pulses                   │                           │
-│   │    → JSON → uart_write_bytes        │──── UART0 ──► host GUI    │
-│   │    → UART RX command handler        │◄─── UART0 ─── host GUI    │
-│   └─────────────────────────────────────┘                           │
-└─────────────────────────────────────────────────────────────────────┘
-```
+---
 
-### Why two cores?
+## Project at a Glance
 
-| Concern | Single-core problem | Dual-core solution |
-|---|---|---|
-| ADC timing jitter | JSON formatting (ms) would delay ADC reads | Core 0 only does ADC + IMU — nothing else |
-| 100 Hz guarantee | Heavy computation causes missed timer ticks | Core 0 timer semaphore is never contested |
-| JSON latency | 100 Hz × 640 B = 25 kB/s — stalls UART | Core 1 handles all I/O; Core 0 is unaffected |
-| ISR safety | UART event ISR + timer ISR on same core = conflicts | ISRs land on Core 0 only; UART events handled Core 1 |
+### What the glove does
 
-### Confirmed dual-core boot
+The glove is trying to answer a simple question:
 
-The boot log confirms multicore mode:
-```
-I (200) cpu_start: Multicore app
-I (208) cpu_start: Pro cpu start user code
-```
+> Is the user applying force and moving in a controlled way, or are they showing
+> excessive force and tremor-like shaking?
 
-`xTaskCreatePinnedToCore` with explicit core IDs enforces the assignment.
-On a single-core build this function does not exist — its presence is proof of dual-core operation.
+To do that, the system combines:
 
-### What to look for in the monitor
+- **force sensing** from three FSR 402 sensors
+- **motion sensing** from a BNO085 IMU
+- **real-time signal processing** on the ESP32
+- **live telemetry and calibration guidance** in a Python GUI
 
-Open the serial monitor and reset the ESP32. The important lines appear only during
-boot and early task startup, so watch the first few seconds after reset.
+### What is implemented today
 
-This is the expected sequence:
+Implemented and working in the current codebase:
+
+- dual-core ESP32 firmware
+- 100 Hz data acquisition
+- live force and motion processing
+- four-step calibration
+- persistent calibration storage in NVS
+- live JSON telemetry at 20 Hz
+- desktop GUI with calibration wizard, plots, session score, and hand visualizer
+
+### What is not fully finished
+
+The codebase includes motor-control scaffolding for haptic feedback, but the motors are
+not yet fully integrated and tested in final hardware. In practical terms:
+
+- the firmware contains motor pulse logic
+- GPIO assignments for the motors exist
+- the hardware/software integration with transistor driver stages was not fully completed
+
+So the glove is ready as a sensing and scoring platform, but haptic motor feedback should
+be treated as an incomplete subsystem.
+
+### The big idea in one sentence
+
+Core 0 samples the glove every 10 ms, Core 1 processes those samples, the GUI displays
+the results, and calibration personalizes the thresholds so the score reflects tremor
+and force problems rather than generic movement.
+
+---
+
+## Why This Project Exists
+
+A surgical trainer should not punish someone just for moving their hand. Real surgical
+movement includes normal grip changes, normal repositioning, and intentional motion.
+What matters more is whether the user shows:
+
+- **too much force**
+- **unstable holding**
+- **tremor-like shaking**
+
+This project tries to separate those categories instead of treating all movement as bad.
+
+### What the score is intended to mean
+
+The score is meant to represent clinical control, not just stillness. In the current
+design, the score is mainly driven by:
+
+- **force behavior**
+- **tremor behavior**
+
+Normal hand movement by itself should not reduce the score.
+
+### Why calibration matters
+
+Every person wears the glove differently. Sensor baselines drift. Hands differ in size,
+grip style, and natural motion. A hardcoded threshold would be fragile. Calibration lets
+the firmware learn:
+
+- what "still" looks like for this user and glove fit
+- what "no finger pressure" looks like
+- what a normal light grip looks like
+- what normal intended hand motion looks like
+
+That makes the runtime scorer far more useful than a one-size-fits-all threshold table.
+
+---
+
+## System Overview
+
+Think of the project as a pipeline:
 
 ```text
-I (...) boot: Multicore bootloader
-I (...) cpu_start: Multicore app
-I (...) main_task: Started on CPU0
-I (...) ACQ: ACQ TASK: running on Core 0 at 100 Hz
-I (...) PROC: PROC TASK: running on Core 1
+FSR sensors + BNO085 IMU
+        |
+        v
+Core 0 acquisition task (100 Hz)
+        |
+        v
+FreeRTOS queue
+        |
+        v
+Core 1 processing task
+  - filtering
+  - calibration logic
+  - warning/error logic
+  - score updates
+  - JSON telemetry
+        |
+        v
+UART0 @ 115200 baud
+        |
+        v
+Python GUI
+  - calibration wizard
+  - plots
+  - status panels
+  - hand visualizer
 ```
 
-How to interpret these lines:
+![Firmware architecture overview](docs/firmware_architecture.svg)
 
-- `boot: Multicore bootloader`
-  - The ESP32 is using the multicore boot path.
-- `cpu_start: Multicore app`
-  - The application image is running in multicore mode.
-- `main_task: Started on CPU0`
-  - ESP-IDF started the initial application task on CPU0.
-- `ACQ TASK: running on Core 0`
-  - The acquisition task is pinned where the firmware expects it.
-- `PROC TASK: running on Core 1`
-  - The processing task is pinned to the second core.
+### End-to-end story
 
-The strongest runtime evidence for this project is seeing both task-placement lines
-after a `Multicore app` boot.
+1. The ESP32 wakes the acquisition task every 10 ms.
+2. The acquisition task reads the three force sensors and tries to read a fresh IMU packet.
+3. It packs the sample into `raw_sample_t` and posts it to a FreeRTOS queue.
+4. The processing task receives the sample on the other core.
+5. The processing task filters the signals, updates contact and motion state, checks
+   warnings/errors, updates the running score, and emits JSON telemetry.
+6. The GUI reads the JSON stream and turns it into human-readable feedback.
 
-If you do not see the expected lines:
+### Why the design is split this way
 
-- Make sure you are looking at the serial monitor output, not the build or flash log.
-- Reset the board after opening the monitor.
-- Watch from the very first boot line; these messages do not repeat during normal runtime.
-- If `ACQ TASK` appears but `PROC TASK` does not, the app booted in multicore mode
-  but the processing task either did not start cleanly or its log was missed.
+The project deliberately separates **sampling** from **thinking**:
 
-### How the cores communicate
+- sampling must happen on time
+- processing can be more computationally expensive
 
-The only data path between cores is a **FreeRTOS queue** (`QueueHandle_t raw_q`):
-- Core 0 calls `xQueueSend()` — non-blocking, drops oldest if full
-- Core 1 calls `xQueueReceive()` — blocks until a sample arrives
-- FreeRTOS internally uses a mutex + critical section to make queue operations
-  thread-safe across cores without any application-level locking
-
-`raw_sample_t` is the unit of transfer: 72 bytes containing timestamp, FSR forces (N),
-accelerometer (g), derived gyroscope (deg/s), quaternion placeholder, and Euler angles.
-In UART-RVC mode the BNO085 does not provide quaternion or gyro reports; quaternion is
-zeroed and gyro is approximated from Euler angle differences at 100 Hz.
+That is why the firmware uses two cores and a queue between them.
 
 ---
 
-## Project Structure
+## Glossary
 
-```
-uart_echo_VitalSignsLab4/
-├── main/
-│   ├── main.c               # app_main: task creation, queue, UART driver
-│   ├── data_types.h         # shared structs (raw_sample_t, cal_params_t) + defines
-│   ├── acquisition.c/.h     # Core 0: timer ISR, ADC, BNO085 UART-RVC, queue post
-│   ├── processing.c/.h      # Core 1: filters, state machine, JSON output, commands
-│   ├── calibration.c/.h     # calibration sub-state machine (C1–C4)
-│   ├── filters.c/.h         # Butterworth IIR biquad implementations
-│   ├── motor_control.c/.h   # vibration motor GPIO pulse control
-│   ├── nvs_storage.c/.h     # NVS persistence for calibration parameters
-│   ├── CMakeLists.txt
-│   └── idf_component.yml
-├── components/
-│   └── sh2/                 # vendored SH-2 driver, currently disabled
-├── gui/
-│   ├── esp32_controller.py  # PySide6 desktop GUI
-│   └── requirements.txt
-├── tests/
-│   ├── fsr_test.py          # standalone FSR diagnostic display
-│   ├── imu_test.py          # standalone IMU diagnostic display
-│   └── dual_core_monitor.py # acquisition/processing timing monitor
-└── CMakeLists.txt
-```
+This section is here so a first-time reader does not have to infer basic terms.
+
+| Term | Meaning in this project |
+|---|---|
+| Task | A FreeRTOS thread of execution |
+| Core | One CPU inside the ESP32 dual-core chip |
+| Queue | A thread-safe FIFO used to pass data from one task/core to another |
+| Real-time | The code must complete repeated work inside a fixed timing deadline |
+| Calibration | A guided process that stores personal reference values |
+| Telemetry | The JSON data stream sent from the ESP32 to the host |
+| Tremor band | The 6-12 Hz motion band used as a tremor indicator |
+| NVS | Non-volatile storage on the ESP32 used to save calibration |
+| Hold state | The glove is engaged and motion is low enough to count as holding still |
+| Active state | The glove is engaged and moving |
 
 ---
 
-## Hardware
+## Hardware Guide
+
+### Main components
+
+| Component | Role |
+|---|---|
+| ESP32 HUZZAH32 | Main microcontroller; runs the firmware and all real-time logic |
+| 3x FSR 402 | Measures finger force at the thumb, index, and middle finger |
+| BNO085 | Measures orientation and acceleration for motion analysis |
+| Host computer | Runs the GUI and displays feedback |
+| Motor driver stage | Intended for haptic feedback; not fully integrated/tested yet |
+
+### Pin map
 
 | Component | GPIO | Notes |
 |---|---|---|
-| FSR 402 thumb | GPIO 34 | ADC1_CH6, input-only |
-| FSR 402 index | GPIO 39 | ADC1_CH3, input-only |
-| FSR 402 middle | GPIO 36 | ADC1_CH0, input-only |
-| BNO085 SDA | GPIO 32 | UART2 RX, BNO085 data out to ESP32 |
-| BNO085 SCL | GPIO 33 | BNO085 UART input, unused in RVC; firmware leaves it input/pull-up |
-| BNO085 P0/PS0 | 3.3 V | High selects UART-RVC when BNO085 resets |
-| BNO085 P1/PS1 | Unconnected | Low by default for UART-RVC |
-| Motor 0 (force warn) | GPIO 25 | NPN driver, MOTORS_ENABLED=0 by default |
-| Motor 1 (force err) | GPIO 26 | NPN driver |
-| Motor 2 (instability) | GPIO 27 | NPN driver |
-| Motor 3 (tremor) | GPIO 14 | NPN driver |
-| Built-in status LED | GPIO 13 | command/mode indicator |
-| Freq proof | GPIO 4 / A5 | toggled every 100 Hz tick for scope verification |
-| Core 1 debug | GPIO 12 | toggled every processing cycle |
+| FSR thumb | GPIO 34 | ADC1_CH6, input-only |
+| FSR index | GPIO 39 | ADC1_CH3, input-only |
+| FSR middle | GPIO 36 | ADC1_CH0, input-only |
+| BNO085 data to ESP32 | GPIO 32 | UART2 RX |
+| BNO085 input from ESP32 | GPIO 33 | Unused in UART-RVC mode |
+| Motor 0 | GPIO 25 | force warning motor |
+| Motor 1 | GPIO 26 | force error motor |
+| Motor 2 | GPIO 27 | instability motor |
+| Motor 3 | GPIO 14 | tremor motor |
+| Status LED | GPIO 13 | built-in board LED |
+| Frequency proof pin | GPIO 4 | toggles every 100 Hz tick |
+| Core 1 debug pin | GPIO 12 | toggles every processing cycle |
 
-### BNO085 UART-RVC wiring notes
+### BNO085 UART-RVC notes
 
-UART-RVC is output-only from the IMU for this project. The required connections are:
+This project uses the BNO085 in **UART-RVC mode**.
 
-- ESP32 3V → BNO085 VIN
-- ESP32 GND → BNO085 GND
-- ESP32 GPIO32 → BNO085 SDA
-- ESP32 3V → BNO085 P0/PS0
-- BNO085 P1/PS1 left unconnected
+Important implications:
 
-The BNO085 samples P0/P1 at reset. After changing P0/P1 wiring, power-cycle the IMU;
-resetting only the ESP32 may leave the BNO085 in its previous mode.
+- the IMU sends orientation and acceleration over UART
+- the firmware derives angular velocity in software from Euler angle differences
+- the firmware does **not** currently use a UART2 event queue for IMU input
+- the acquisition task reads the IMU directly each cycle
 
-Here, "power-cycle the IMU" means removing electrical power from the IMU itself
-for a moment so it fully turns off, then restoring power. Pressing `EN`, rebooting,
-or resetting only the ESP32 does not guarantee that the BNO085 re-reads `P0/P1`.
+Required wiring:
+
+- ESP32 3.3 V -> BNO085 VIN
+- ESP32 GND -> BNO085 GND
+- ESP32 GPIO32 -> BNO085 SDA
+- BNO085 `P0/PS0` tied high
+- BNO085 `P1/PS1` low or unconnected
+
+After changing `P0/P1`, power-cycle the IMU itself. Resetting only the ESP32 is not
+enough to guarantee the BNO085 re-enters UART-RVC mode.
+
+### What "force" means here
+
+The glove does not measure force directly in SI units at the sensor. Each FSR is a
+nonlinear sensor whose voltage changes with pressure. The firmware:
+
+1. samples ADC voltage
+2. converts millivolts into an estimated Newton value through a lookup/interpolation model
+3. uses calibration and thresholds on those Newton estimates
+
+So when you see force in the GUI, that is an interpreted engineering quantity, not raw ADC.
+
+### Motor status
+
+The code has a motor subsystem (`motor_control.c/.h`) and warning events still trigger
+motor pulse calls, but `MOTORS_ENABLED` is set to `0` in `main/data_types.h`. That means:
+
+- the interface exists
+- the warning-to-motor mapping exists
+- the current project should be presented as **sensor-first**, with haptic feedback
+  hardware still incomplete
 
 ---
 
-## Force Thresholds
+## Firmware Architecture
 
-Values from Horeman et al. 2010 (surgical simulation literature):
+### The short version
 
-| Level | Per-finger | F_sum | Notes |
-|---|---|---|---|
-| Expert mean | — | 0.9 N | F_ref_open default |
-| Warning | > 0.8 N | > 2.0 N sustained 100 ms | Above expert mean |
-| Error | > 1.5 N | > 4.0 N sustained 100 ms | Near novice maximum (4.7 N) |
+The firmware is divided into two responsibilities:
 
-Mode commands `E` / `M` / `H` scale the F_sum thresholds by multiplying F_ref_open:
+- **Core 0** acquires data on time
+- **Core 1** processes data and handles host interaction
 
-| Mode | Warn multiplier | Error multiplier |
-|---|---|---|
-| Easy | 2.5× | 4.0× |
-| Medium (default) | 2.0× | 3.5× |
-| Hard | 1.5× | 2.5× |
+### The actual task split
+
+```text
+CORE 0 (acquisition)
+  esp_timer callback -> semaphore
+  acquisition_task wakes
+  reads ADC + IMU
+  posts raw_sample_t to queue
+
+CORE 1 (processing)
+  processing_task waits on queue
+  filters and interprets sample
+  updates warnings, errors, score, and state
+  sends JSON to host
+  receives UART0 command events
+```
+
+### Why this matters
+
+If one task did everything on one core, JSON formatting, GUI traffic, and signal
+processing could delay sampling. This design isolates timing-sensitive work from
+higher-level work.
+
+### Queue handoff
+
+The two cores communicate through one FreeRTOS queue:
+
+- producer: `acquisition_task`
+- consumer: `processing_task`
+- item type: `raw_sample_t`
+
+This is the clean boundary in the firmware. If you want to understand the system, learn
+that struct and the producer-consumer relationship first.
 
 ---
 
-## UART Protocol
+## Real-Time Behavior
 
-All communication is over UART0 (115200 baud, GPIO 1=TX, 3=RX).
+This project should be explained in the class definition of real-time:
 
-### Commands (host → ESP32)
+> Real-time programming is not "run as fast as possible." It means a repeated task must
+> complete its work within a specified time interval.
 
-| Byte | Response | Effect |
+### What is the repeated real-time task here?
+
+The repeated time-critical task is **sensor acquisition at 100 Hz**.
+
+- period: 10 ms
+- source: `esp_timer_start_periodic(..., 10000)`
+- deadline: the acquisition path must keep up with one full sample cycle every 10 ms
+
+### How the timing works
+
+The firmware uses an `esp_timer` periodic callback every 10,000 microseconds.
+That callback:
+
+- runs via `ESP_TIMER_TASK`
+- gives `s_timer_sem`
+- wakes `acquisition_task`
+
+Then `acquisition_task`:
+
+- blocks until the semaphore is released
+- reads all three FSR channels
+- reads the BNO085 packet if available
+- fills `raw_sample_t`
+- sends that sample to the queue
+
+The important point is that the acquisition task is driven by a fixed schedule.
+
+### Why this is real-time
+
+It is real-time because:
+
+- the job is periodic
+- the period is fixed
+- the work has a deadline
+- missing the deadline would degrade the correctness of the system
+
+### What this is not
+
+It is **not** merely:
+
+- using a fast microcontroller
+- writing optimized C
+- updating the GUI quickly
+
+Those help, but they are not the definition of real-time.
+
+---
+
+## Multitasking Behavior
+
+This project should also be explained in class terms:
+
+> Computer multitasking is the apparent simultaneous performance of one or more tasks by a CPU.
+
+### How multitasking appears in this project
+
+FreeRTOS provides multiple tasks:
+
+- `acquisition_task`
+- `processing_task`
+- background framework tasks such as the timer task and UART driver support
+
+On top of that, the ESP32 has two physical cores. The code pins the main application
+tasks to different cores with `xTaskCreatePinnedToCore`.
+
+### Why that distinction matters
+
+FreeRTOS gives the project a multitasking model. The dual-core ESP32 turns the two main
+application paths into genuine parallel execution:
+
+- acquisition on Core 0
+- processing on Core 1
+
+So the system is both:
+
+- a multitasking system in the software sense
+- a parallel dual-core design in the hardware sense
+
+### Why the professor will care
+
+If you present this project, the correct phrasing is:
+
+- multitasking is provided by FreeRTOS tasks
+- the dual-core ESP32 lets the two critical tasks run in parallel
+- the queue is the synchronization boundary between them
+
+Do not reduce the explanation to "it uses two cores, so it is multitasking." That is
+too loose and will sound less rigorous than the actual design.
+
+---
+
+## Code Tour by Subsystem
+
+This section is the guided tour for someone opening the codebase for the first time.
+
+### 1. `main/main.c` — startup and system wiring
+
+Start here if you want the top-level picture.
+
+`main.c` does the following:
+
+- loads saved calibration from NVS, or defaults if none exist
+- creates the inter-core queue
+- initializes acquisition support
+- initializes LED and motor subsystems
+- installs the UART0 driver and gets its event queue
+- initializes processing with the sample queue, UART event queue, and calibration pointer
+- creates the two pinned tasks
+- prints a `READY` line to the host
+
+If you want to understand how the application is assembled, `main.c` is the entry point.
+
+Jump into code:
+
+- [`main/main.c`](main/main.c) — top-level startup file
+- `app_main()` starts around line 29
+- queue creation is around lines 58-74
+- UART0 driver install is around lines 81-103
+- `xTaskCreatePinnedToCore(...)` calls are around lines 134-148
+
+### 2. `main/acquisition.c` and `main/acquisition.h` — Core 0 data acquisition
+
+This subsystem is responsible for getting raw measurements into the system on time.
+
+Key responsibilities:
+
+- configure ADC1 for the three FSR inputs
+- configure UART2 for the BNO085
+- create the periodic `esp_timer`
+- wake on every 10 ms tick
+- read sensor values
+- estimate IMU angular velocity from Euler differences
+- push `raw_sample_t` into the queue
+
+Important things to notice in the code:
+
+- `timer_isr_cb()` gives the semaphore
+- `acquisition_task()` blocks on the semaphore
+- if the queue is full, the oldest sample is dropped so the system stays live
+
+That last point is important: the code prefers **fresh data** over backlog.
+
+Jump into code:
+
+- [`main/acquisition.c`](main/acquisition.c) — acquisition implementation
+- [`main/acquisition.h`](main/acquisition.h) — acquisition design notes and public API
+- `timer_isr_cb()` starts around line 93
+- `acquisition_init()` starts around line 197
+- `acquisition_task()` starts around line 254
+- the ADC-to-force sampling loop is around lines 282-290
+- the UART-RVC read and gyro derivation logic is around lines 299-321
+
+### 3. `main/processing.c` and `main/processing.h` — Core 1 interpretation
+
+This is the brain of the runtime system.
+
+Key responsibilities:
+
+- receive each `raw_sample_t`
+- smooth and filter force and motion signals
+- determine contact, engagement, and board state
+- compute tremor indicators
+- apply warning and error logic
+- update the score
+- emit JSON telemetry
+- parse UART0 commands from the host
+
+If you are trying to change scoring, thresholds, warning behavior, or telemetry, this is
+the file you will spend the most time in.
+
+Jump into code:
+
+- [`main/processing.c`](main/processing.c) — runtime logic
+- [`main/processing.h`](main/processing.h) — module interface
+- `processing_init(...)` starts around line 430
+- `processing_task()` starts around line 500
+- per-axis tremor band-pass filtering is around lines 542-550
+- engagement and board-state logic is around lines 608-663
+- warning/error logic starts around line 665
+- JSON telemetry formatting starts around line 762
+
+### 4. `main/calibration.c` and `main/calibration.h` — guided personalization
+
+This subsystem captures the reference values that make the runtime logic user-specific.
+
+Current active flow:
+
+- `C1`: still-hand tremor baseline
+- `C2`: relaxed-finger pressure baseline
+- `C3`: normal light grip
+- `C4`: normal hand motion
+
+Important detail: the file still contains some older C3/C4-era legacy structures and
+deprecated command responses from earlier experiments. The active user-facing flow is the
+four-step version above.
+
+Jump into code:
+
+- [`main/calibration.c`](main/calibration.c) — calibration implementation
+- [`main/calibration.h`](main/calibration.h) — calibration API and step definitions
+- `cal_c1(...)` starts around line 1030
+- `cal_c2(...)` starts around line 1123
+- `cal_c3_grip(...)` starts around line 1202
+- `cal_c4_motion(...)` starts around line 1236
+- `calibration_run(...)` starts around line 1283
+
+### 5. `main/filters.c` and `main/filters.h` — signal-processing primitives
+
+This subsystem contains the reusable digital filters. These are not just cosmetic
+smoothing filters. They are how the firmware turns noisy physical measurements into
+stable interpretable signals.
+
+Examples:
+
+- low-pass force smoothing
+- low-pass IMU smoothing
+- band-pass 6-12 Hz tremor isolation
+
+Jump into code:
+
+- [`main/filters.c`](main/filters.c)
+- [`main/filters.h`](main/filters.h)
+- these files define the reusable IIR filter building blocks used by both runtime scoring
+  and calibration
+
+### 6. `main/nvs_storage.c` and `main/nvs_storage.h` — persistence
+
+This subsystem reads and writes `cal_params_t` to ESP32 NVS.
+
+Why it matters:
+
+- without it, calibration would be lost on reset
+- with it, the glove remembers its references between sessions
+
+Jump into code:
+
+- [`main/nvs_storage.c`](main/nvs_storage.c)
+- [`main/nvs_storage.h`](main/nvs_storage.h)
+- defaults are initialized in `nvs_get_defaults(...)`
+- load/save behavior is implemented in `nvs_load_calibration(...)` and `nvs_save_calibration(...)`
+
+### 7. `main/motor_control.c/.h` and `main/led_status.c/.h` — feedback peripherals
+
+- `motor_control` manages timed motor pulses
+- `led_status` controls the status LED behavior
+
+Even though motors are not fully deployed in hardware, this code is still useful to
+understand because warning events are already wired to these interfaces.
+
+Jump into code:
+
+- [`main/motor_control.c`](main/motor_control.c)
+- [`main/motor_control.h`](main/motor_control.h)
+- [`main/led_status.c`](main/led_status.c)
+- [`main/led_status.h`](main/led_status.h)
+
+### 8. `gui/esp32_controller.py` — the main desktop application
+
+This is the operator-facing control surface.
+
+It handles:
+
+- serial connection
+- calibration wizard
+- live metrics and plots
+- session scoring display
+- command buttons and modes
+
+If you want to change the wording, labels, calibration flow, or GUI behavior, start here.
+
+Jump into code:
+
+- [`gui/esp32_controller.py`](gui/esp32_controller.py)
+- `CALIBRATION_STEPS` starts around line 95
+- the active calibration order `CORE_CALIBRATION_FLOW` is around line 146
+- C3/C4 stage-event handling is around lines 1011-1117
+
+### 9. `gui/hand_visualizer.py` — motion/force visualization
+
+This file turns telemetry into a 3D-style hand visualizer. It is part of the "wow factor"
+of the project because it makes the otherwise abstract telemetry visible to the user.
+
+Jump into code:
+
+- [`gui/hand_visualizer.py`](gui/hand_visualizer.py)
+
+### 10. `tests/` scripts — focused diagnostics
+
+These scripts are worth treating as part of the documentation:
+
+- `tests/fsr_test.py` helps validate force sensing
+- `tests/imu_test.py` helps validate IMU data
+- `tests/dual_core_monitor.py` helps validate timing behavior
+
+Jump into code:
+
+- [`tests/fsr_test.py`](tests/fsr_test.py)
+- [`tests/imu_test.py`](tests/imu_test.py)
+- [`tests/dual_core_monitor.py`](tests/dual_core_monitor.py)
+
+---
+
+## Calibration Guide
+
+Calibration is where the glove learns what is normal for the current user and fit.
+
+### C1 — Still Hand
+
+**User meaning:** keep the hand still.
+
+**Firmware meaning:** measure the no-motion 6-12 Hz tremor-band baseline so later tremor
+scoring can compare live motion against a personal stillness reference.
+
+What it stores:
+
+- `tremor_rms_ref`
+
+### C2 — Relaxed Fingers
+
+**User meaning:** do not press the force sensors.
+
+**Firmware meaning:** measure the baseline force distribution and compute contact-on and
+contact-off thresholds for each finger.
+
+What it stores:
+
+- `mu[3]`
+- `sigma[3]`
+- `on_thresh[3]`
+- `off_thresh[3]`
+
+### C3 — Normal Light Grip
+
+**User meaning:** hold the glove with a normal light training grip.
+
+**Firmware meaning:** learn a personal grip-force reference so the runtime force thresholds
+scale from a meaningful user-specific value instead of a hardcoded assumption.
+
+What it stores:
+
+- `f_ref_open`
+
+### C4 — Normal Hand Motion
+
+**User meaning:** keep a light grip and move the hand naturally.
+
+**Firmware meaning:** learn what intentional movement looks like so the system can separate
+normal hand motion from tremor-like motion.
+
+What it stores:
+
+- `f95_ref`
+- `pp_roll_ref`
+- `pp_pitch_ref`
+- `motion_rms_ref`
+- `motion_tremor_ratio_ref`
+
+### Why this matters at runtime
+
+After calibration:
+
+- force thresholds are scaled from the learned grip reference
+- tremor logic can compare live tremor-band behavior against both:
+  - a still-hand baseline
+  - a normal-motion baseline
+
+That is what lets the project avoid treating all movement as bad.
+
+### Current public calibration commands
+
+| Command | Meaning |
+|---|---|
+| `C1` | Run still-hand calibration |
+| `C2` | Run relaxed-fingers calibration |
+| `C3` | Run normal light grip calibration |
+| `C4` | Run normal hand motion calibration |
+| `Z` | Erase saved calibration |
+
+There are a few deprecated calibration-related command paths left in the code for legacy
+compatibility, but the active supported workflow is `C1` through `C4`.
+
+---
+
+## Scoring and Warning Logic
+
+### The main idea
+
+The runtime logic is trying to answer:
+
+- Is the glove engaged?
+- Is the hand holding still or moving?
+- Is the force acceptable?
+- Is the motion tremor-like?
+
+### Board state
+
+The processing task reduces behavior to four broad states:
+
+- `IDLE`
+- `HOLD`
+- `ACTIVE`
+- `EXITED`
+
+Broadly:
+
+- `IDLE` means not engaged
+- `HOLD` means engaged and relatively still
+- `ACTIVE` means engaged and moving
+- `EXITED` means the tasks were suspended by command
+
+### What affects warnings and errors
+
+The current logic checks several categories:
+
+- hold instability
+- tremor
+- force opening / excessive force
+- sustained compression
+- force variability
+- force spikes
+
+### What should affect the score
+
+The important conceptual rule is:
+
+> The score should reflect force problems and tremor problems, not normal intended hand motion.
+
+That is why C4 exists.
+
+### Force logic
+
+The code uses:
+
+- per-finger thresholds
+- summed force thresholds
+- sustained time windows
+- force derivative checks for spikes
+
+Mode commands (`E`, `M`, `H`) scale force thresholds using `f_ref_open`.
+
+### Tremor logic
+
+Tremor is not just "motion is large." The code treats tremor as a combination of:
+
+- enough energy above the still baseline
+- enough of the motion being concentrated in the 6-12 Hz tremor band
+
+This is a better distinction than raw motion magnitude alone.
+
+### Telemetry cheat sheet
+
+| Field | Meaning |
+|---|---|
+| `t` | sample timestamp in ms |
+| `f0`, `f1`, `f2` | thumb/index/middle force in Newtons |
+| `ax`, `ay`, `az` | acceleration in g |
+| `gx`, `gy`, `gz` | derived angular velocity in deg/s |
+| `roll`, `pitch`, `yaw` | orientation angles in degrees |
+| `f_sum` | total grip force |
+| `tremor` | live tremor index used for reporting |
+| `f95` | 95 percent power frequency estimate |
+| `pp_roll`, `pp_pitch` | peak-to-peak motion over the current analysis window |
+| `cv_f` | force coefficient of variation |
+| `swing` | swing-rate style motion metric |
+| `contact` | per-finger contact flags |
+| `engaged` | whether the instrument is considered engaged |
+| `gate` | whether engagement came from `FSR`, `IMU`, or `NONE` |
+| `state` | `IDLE`, `HOLD`, `ACTIVE`, or `EXITED` |
+| `warn`, `err` | warning/error bitmasks |
+| `score` | running performance score |
+| `actual_hz` | firmware-reported nominal/observed sample rate field |
+
+### Warning bitmasks
+
+Defined in `main/data_types.h`:
+
+- `WARN_HOLD_INSTABILITY`
+- `WARN_TREMOR`
+- `WARN_SMOOTHNESS`
+- `WARN_SWING_RATE`
+- `WARN_FORCE_OPEN`
+- `WARN_FORCE_VARIABILITY`
+- `WARN_FORCE_SPIKE`
+
+### Error bitmasks
+
+- `ERR_HOLD_INSTABILITY`
+- `ERR_TREMOR`
+- `ERR_FORCE_OPEN`
+- `ERR_SUSTAINED_COMPRESS`
+
+If you modify the scoring model, this is one of the first places to inspect.
+
+---
+
+## UART Protocol and Telemetry
+
+All host communication uses UART0 at 115200 baud.
+
+### Commands (host -> ESP32)
+
+| Byte/String | Response | Effect |
 |---|---|---|
-| `I` | `ESP32_TRAINER` | Identify |
-| `E` | `EASY` | Easy force thresholds |
-| `M` | `INTERMEDIATE` | Medium force thresholds |
-| `H` | `HARD` | Hard force thresholds |
-| `S` | `STOPPED` | Reset state to IDLE |
-| `C1`–`C4` | JSON status | Run calibration step |
-| `X` | `EXITED` | Suspend all tasks |
-| `Z` | JSON | Erase NVS calibration |
+| `I` | `ESP32_TRAINER` | identify device |
+| `E` | `EASY` | easy thresholds |
+| `M` | `INTERMEDIATE` | medium thresholds |
+| `H` | `HARD` | hard thresholds |
+| `S` | `STOPPED` | reset runtime state |
+| `C1` | JSON | run Step 1 calibration |
+| `C2` | JSON | run Step 2 calibration |
+| `C3` | JSON | run Step 3 calibration |
+| `C4` | JSON | run Step 4 calibration |
+| `X` | `EXITED` | suspend tasks |
+| `Z` | JSON | erase saved calibration |
 
-### Telemetry (ESP32 → host, 20 Hz)
+### Telemetry rate
+
+The firmware processes samples at 100 Hz but emits JSON every 5th sample, so host telemetry
+is approximately 20 Hz.
+
+That is a deliberate bandwidth decision:
+
+- processing stays at 100 Hz
+- serial output is reduced so it does not dominate runtime behavior
+- the UART TX ring buffer absorbs bursts
+
+### Example telemetry packet
 
 ```json
 {"t":12340,"f0":0.196,"f1":0.000,"f2":0.000,
- "ax":0.01,"ay":-0.02,"az":1.00,
- "gx":0.1,"gy":-0.2,"gz":0.0,
+ "ax":0.010,"ay":-0.020,"az":1.000,
+ "gx":0.10,"gy":-0.20,"gz":0.00,
  "roll":1.2,"pitch":-0.5,"yaw":45.0,
  "f_sum":0.196,"tremor":0.02,"f95":1.6,
  "pp_roll":0.5,"pp_pitch":0.3,"cv_f":0.04,"swing":0.0,
- "contact":[1,0,0],"state":"HOLD",
- "warn":0,"err":0,"score":100.0,"actual_hz":100.00}
+ "contact":[1,0,0],"engaged":1,"gate":"FSR",
+ "state":"HOLD","warn":0,"err":0,
+ "score":100.0,"actual_hz":100.00}
 ```
 
-JSON is output at 20 Hz (every 5th sample) to stay within 115200 baud capacity.
-The `actual_hz` field is currently a nominal firmware value; use
-`tests/dual_core_monitor.py` or a scope on GPIO4/A5 for timing verification.
+### Timing and asynchronous event sources
+
+The project has three important asynchronous/event-driven paths:
+
+1. `esp_timer` callback -> gives `s_timer_sem`
+2. UART0 driver -> posts `UART_DATA` events to `uart_event_q`
+3. BNO085 UART-RVC -> read directly by `acquisition_task` each cycle
+
+That third point matters because the IMU path is **not** currently modeled as a UART2
+event queue consumer.
 
 ---
 
-## Build and Flash
+## GUI Guide
+
+The GUI is the human-facing side of the project.
+
+### What it does
+
+- connects to the ESP32 serial port
+- runs the four-step calibration wizard
+- shows live telemetry
+- shows warning/error state
+- plots force, motion, and score over time
+- renders a hand visualization
+
+### What the user sees during calibration
+
+The calibration wizard presents the current supported flow:
+
+1. Still Hand
+2. Finger Pressure
+3. Normal Light Grip
+4. Normal Hand Motion
+
+This is important because the GUI wording and the firmware commands now match. Older
+directional wording like `yaw_right`, `pitch_back`, or `figure8` should not be treated
+as the active workflow anymore.
+
+### Why the GUI matters technically
+
+The GUI is not just decoration. It is the primary debugging surface for:
+
+- serial transport health
+- calibration sequencing
+- score evolution
+- warning/error interpretation
+- validating whether the firmware is reacting to real glove behavior
+
+---
+
+## Build, Flash, and Run
+
+### Prerequisites
+
+- ESP-IDF v6.x installed locally
+- Python 3 for the GUI and test tools
+- serial access to the ESP32
+
+### Build firmware
 
 ```bash
-# Source ESP-IDF (path depends on local install)
 source ~/.espressif/tools/activate_idf_v6.0.sh
-
-# Build
 python3 ~/.espressif/v6.0/esp-idf/tools/idf.py build
+```
 
-# Flash and monitor
+### Flash and monitor
+
+```bash
 python3 ~/.espressif/v6.0/esp-idf/tools/idf.py -p /dev/cu.usbserial-XXXX flash monitor
 ```
 
 Exit the monitor with `Ctrl-]`.
 
+### Run the GUI
+
+```bash
+pip install -r gui/requirements.txt
+python gui/esp32_controller.py
+```
+
+### Expected startup behavior
+
+At boot, the firmware should:
+
+- initialize calibration values from NVS or defaults
+- create the queue
+- start acquisition on Core 0
+- start processing on Core 1
+- print a ready message over UART0
+
+If you are verifying the dual-core behavior live, watch for the boot log and the task
+placement logs immediately after reset.
+
 ---
 
 ## Diagnostic Tools
 
-Test force sensors without the full GUI:
+These scripts are useful because they isolate subsystems.
+
+### Force sensor test
 
 ```bash
-python tests/fsr_test.py              # auto-detect port
-python tests/fsr_test.py --list-ports # show all serial ports
-python tests/fsr_test.py --log        # also write CSV log
+python tests/fsr_test.py
+python tests/fsr_test.py --list-ports
+python tests/fsr_test.py --log
 ```
 
-Test the BNO085 UART-RVC stream:
+Use this when you want to validate FSR behavior without the full GUI.
+
+### IMU test
 
 ```bash
-python tests/imu_test.py              # auto-detect port
-python tests/imu_test.py --raw        # show raw JSON lines too
+python tests/imu_test.py
+python tests/imu_test.py --raw
 ```
 
-Monitor software timing:
+Use this when the IMU seems dead, stuck, or misconfigured.
+
+### Dual-core / timing monitor
 
 ```bash
 python tests/dual_core_monitor.py
@@ -287,96 +988,219 @@ python tests/dual_core_monitor.py --list-ports
 python tests/dual_core_monitor.py --port /dev/cu.usbserial-XXXX
 ```
 
-`dual_core_monitor.py` provides software evidence that acquisition timing remains
-stable while processing and UART output are active. It reconstructs the 100 Hz
-acquisition period from firmware timestamps and compares that against the host-side
-JSON receive cadence. This is consistent with the dual-core design, but it is not
-formal proof of multicore execution by itself. The stronger proof is:
-
-- the ESP32 multicore boot log,
-- `xTaskCreatePinnedToCore(..., 0/1)` in the firmware, and
-- hardware observation of the debug pins:
-  - GPIO4 / A5 = Core 0 acquisition heartbeat
-  - GPIO12 = Core 1 processing heartbeat
+This helps validate timing stability and host-observed telemetry behavior.
 
 ---
 
-## Python GUI
+## How to Modify the Project
 
-```bash
-pip install -r gui/requirements.txt
-python gui/esp32_controller.py
-```
+This section is written as a teaching recipe. Use it when you want to change behavior
+without getting lost.
+
+### Recipe 1 — Change a force or tremor threshold
+
+Start in:
+
+- `main/data_types.h`
+- `main/processing.c`
+
+What to look for:
+
+- force threshold constants such as `FORCE_WARN_SUM_N`
+- tremor threshold constants such as `TREMOR_MED_WARN_EXCESS_DPS`
+- runtime threshold application in `processing.c`
+
+What concept you are changing:
+
+- when the firmware decides a warning or error should happen
+- how sensitive the score becomes
+
+What to test afterward:
+
+- does a normal session still avoid false warnings?
+- do obvious excessive-force cases still trigger?
+- do mode commands `E`, `M`, `H` still scale as expected?
+
+### Recipe 2 — Add a telemetry field
+
+Start in:
+
+- `main/processing.c`
+- optionally `gui/esp32_controller.py`
+
+What to do:
+
+1. identify where the value is computed in `processing.c`
+2. add it to the `snprintf` JSON block
+3. update the GUI parser if the GUI should display it
+
+What concept you are changing:
+
+- host visibility, not sensor acquisition itself
+
+What to test afterward:
+
+- the JSON stays valid
+- the GUI does not crash on missing/new fields
+- telemetry bandwidth remains reasonable
+
+### Recipe 3 — Adjust calibration timing or strictness
+
+Start in:
+
+- `main/calibration.c`
+
+What to look for:
+
+- sample-count constants
+- timeout constants
+- force and motion acceptance thresholds
+
+Examples:
+
+- make grip hold longer or shorter
+- require more motion for C4
+- loosen the stillness requirement for C1
+
+What concept you are changing:
+
+- what the system considers a clean calibration capture
+
+What to test afterward:
+
+- each step still passes for a real user
+- noisy or bad calibrations still fail
+- runtime scoring still makes sense afterward
+
+### Recipe 4 — Change GUI labels or calibration copy
+
+Start in:
+
+- `gui/esp32_controller.py`
+
+What to look for:
+
+- `CALIBRATION_STEPS`
+- status text
+- success/failure wording
+
+What concept you are changing:
+
+- user communication, not firmware behavior
+
+What to test afterward:
+
+- the wording matches the firmware commands
+- no stale directional terminology remains
+- the calibration wizard flow still makes sense visually
+
+### A good rule when modifying anything
+
+Ask two questions:
+
+1. Does this change affect **calibration**, **runtime scoring**, or **telemetry**?
+2. Which file owns that concept?
+
+That mental model will save you time:
+
+- acquisition owns sensor sampling
+- processing owns runtime interpretation
+- calibration owns personal references
+- GUI owns wording and visualization
 
 ---
 
 ## Troubleshooting
 
-### I only see the flash output, not the boot log
-The ESP-IDF flash task output is not the same thing as the ESP32 runtime monitor output.
-`Flash Done` only means the image was written successfully.
+### I only see flash output, not the real boot log
 
-To verify multicore boot and task placement:
+The flash output is not the same as runtime monitor output.
 
-1. Open `idf.py monitor` or `ESP-IDF: Monitor Device`.
-2. Press the ESP32 `EN` / reset button.
-3. Watch the first lines printed after reset.
+To inspect the runtime boot sequence:
 
-You are looking for:
-
-- `boot: Multicore bootloader`
-- `cpu_start: Multicore app`
-- `ACQ TASK: running on Core 0`
-- `PROC TASK: running on Core 1`
-
-If you open the monitor after the board already booted, reset it again or you will
-miss the boot log.
+1. open `idf.py monitor`
+2. reset the board
+3. watch the first lines immediately after reset
 
 ### IMU fields stay zero
-The firmware is in BNO085 UART-RVC mode, not I2C/SH-2 mode. Check:
 
-- BNO085 SDA is wired to ESP32 GPIO32.
-- BNO085 P0/PS0 is tied to 3.3 V.
-- BNO085 P1/PS1 is unconnected/low.
-- BNO085 and ESP32 share ground.
-- The BNO085 was power-cycled after P0/P1 wiring changed.
+Check:
 
-What "power-cycled" means in practice:
+- wiring to GPIO32
+- `P0/PS0` high before power-up
+- `P1/PS1` low/unconnected
+- common ground
+- actual IMU power cycle after wiring changes
 
-- Unplug USB from the ESP32, or disconnect the IMU `VIN` / `3.3 V` lead.
-- Wait 1-2 seconds so the IMU fully loses power.
-- Restore power, then test again.
+### The IMU has power but still sends no useful motion
 
-Why this matters:
+The LED only proves power, not mode correctness.
 
-- The ESP32 can reboot while the BNO085 stays powered.
-- The BNO085 chooses its interface mode only when it powers up or resets.
-- If the IMU never lost power, it may stay in its previous interface mode even if
-  the wiring is now correct.
+Try:
 
-RVC does not require ESP32 TX. If debugging, disconnect BNO085 SCL from GPIO33 and
-leave only SDA→GPIO32 plus power, ground, and P0 high.
+- explicit `P1/PS1` to ground during bring-up
+- a full power cycle
+- `python tests/imu_test.py --raw` with the serial monitor closed
 
-### IMU has power, but still no motion data
-The green LED on the IMU only shows that the board is powered. It does not prove
-that the BNO085 is in UART-RVC mode or transmitting valid packets.
+### Force readings look wrong
 
-If the IMU LED is on but the JSON `ax/ay/az/roll/pitch/yaw/gx/gy/gz` fields stay zero:
+Use `tests/fsr_test.py` first. That tells you whether the problem is:
 
-- Verify `P0/PS0` is high before power-up.
-- Prefer tying `P1/PS1` explicitly to GND during bring-up instead of relying on it
-  floating low.
-- Fully remove power from the IMU and power it back on.
-- Run `python tests/imu_test.py --raw` with `idf.py monitor` closed.
+- sensor wiring
+- ADC conversion
+- force-model assumptions
+- higher-level processing
 
-### fsr_test.py connects to wrong port
-Run `python tests/fsr_test.py --list-ports` to see all detected ports.
-`/dev/cu.wlan-debug` is a macOS system port, not the ESP32.
-The script prefers `usbserial`/`usbmodem` ports and skips `wlan-debug`, `Bluetooth`, and `BTLE`.
+### The GUI or test script cannot connect
 
-### JSON output stops / 0 samples
-Only one process can hold the serial port at a time.
-Stop `idf.py monitor` (`Ctrl-]`) before running `fsr_test.py` or the GUI.
+Only one program can own the serial port at a time.
 
-### `X` was pressed and commands no longer work
-Expected — `X` suspends both FreeRTOS tasks. Reset the board to resume.
+Stop:
+
+- `idf.py monitor`
+- any other Python serial tool
+
+before launching the GUI or test scripts.
+
+### Calibration feels wrong or stale
+
+Erase saved calibration with `Z` and rerun:
+
+1. `C1`
+2. `C2`
+3. `C3`
+4. `C4`
+
+Do this especially after:
+
+- changing glove fit
+- changing users
+- changing force thresholds or calibration logic
+
+### `X` was sent and the board stopped responding
+
+That is expected. `X` suspends the tasks. Reset the board to resume normal operation.
+
+---
+
+## Final Advice for Reading the Code
+
+If you are new to the codebase, read it in this order:
+
+1. `main/main.c`
+2. `main/data_types.h`
+3. `main/acquisition.c`
+4. `main/processing.c`
+5. `main/calibration.c`
+6. `gui/esp32_controller.py`
+
+That order mirrors how the system actually works:
+
+- startup
+- shared data definitions
+- sampling
+- interpretation
+- calibration
+- presentation
+
+If you keep that mental model, the project becomes much easier to modify without breaking it.
