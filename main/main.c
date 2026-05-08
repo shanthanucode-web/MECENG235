@@ -8,6 +8,7 @@
 
 #include "data_types.h"
 #include "acquisition.h"
+#include "control.h"
 #include "led_status.h"
 #include "processing.h"
 #include "motor_control.h"
@@ -105,8 +106,9 @@ void app_main(void)
     /* Silence ESP_LOG so log messages do not fragment JSON output */
     esp_log_set_vprintf(null_log_vprintf);
 
-    /* ── Processing module init ─────────────────────────────────────── */
-    processing_init(raw_q, uart_event_q, &s_cal);
+    /* ── Processing / control module init ──────────────────────────── */
+    processing_init(raw_q, &s_cal);
+    control_init(uart_event_q);
 
     /* ── Spawn tasks — each pinned to a dedicated core ─────────────── */
     /*
@@ -117,11 +119,19 @@ void app_main(void)
      * dual-core rather than time-sliced on one core.
      *
      * Core 0 — PRO CPU — acquisition_task
-     *   Dedicated to hard-real-time sensor sampling.  Nothing else
-     *   runs here that could introduce jitter.  Priority 10 ensures
-     *   the esp_timer task (priority 22) can still pre-empt it to
-     *   fire the 100 Hz semaphore, but no lower-priority work competes.
+     *   Dedicated to hard-real-time sensor sampling.  The only other
+     *   project task on this core is the low-priority control task, so the
+     *   acquisition path still stays isolated from heavy processing work.
+     *   Priority 10 ensures the esp_timer task (priority 22) can still
+     *   pre-empt it to fire the 100 Hz semaphore.
      *   Stack: 4096 B — only needs ADC reads, UART-RVC reads, and queue post.
+     *
+     * Core 0 — PRO CPU — control_task
+     *   Real low-priority control plane: UART command ingress, command
+     *   parsing, coordination with Core 1, and proof-mode control.
+     *   This task is always present because host control should not live in
+     *   the hard-real-time acquisition loop. Priority 1 keeps it below
+     *   acquisition so timer/acquisition work can preempt it.
      *
      * Core 1 — APP CPU — processing_task
      *   Handles all computation, filtering, JSON formatting, and UART I/O.
@@ -136,6 +146,14 @@ void app_main(void)
                             4096,   /* stack: ADC + UART-RVC + queue post */
                             NULL,
                             10,     /* priority */
+                            NULL,
+                            0);     /* ← Core 0 (PRO CPU) */
+
+    xTaskCreatePinnedToCore(control_task,
+                            "ctrl_task",
+                            4096,   /* stack: UART commands + proof coordination */
+                            NULL,
+                            1,      /* low-priority control plane */
                             NULL,
                             0);     /* ← Core 0 (PRO CPU) */
 

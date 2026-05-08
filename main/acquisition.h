@@ -3,6 +3,8 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 /*
  * CORE 0 — Acquisition Module
@@ -54,3 +56,44 @@ esp_err_t acquisition_init(QueueHandle_t out_queue);
  *   5. Every 100 samples: log actual measured acquisition rate
  */
 void acquisition_task(void *arg);
+
+typedef enum {
+    MT_TRACE_TIMER_CB_BEGIN = 0,
+    MT_TRACE_SEM_GIVE,
+    MT_TRACE_ACQ_WAKE,
+    MT_TRACE_ACQ_DONE,
+    MT_TRACE_CTRL_RESUME,
+} mt_trace_event_code_t;
+
+typedef struct {
+    uint32_t              seq;
+    uint32_t              cycle_id;
+    int64_t               t_us;
+    uint8_t               core_id;
+    mt_trace_event_code_t code;
+    uint32_t              aux;
+} mt_trace_event_t;
+
+/*
+ * Multitasking proof trace control.
+ *
+ * When enabled, Core 0 emits a compact event stream that captures the
+ * preemption chain used in the class-definition multitasking proof:
+ *   control task running -> timer callback begins -> semaphore given
+ *   -> acquisition wakes -> acquisition done -> control task resumes
+ *
+ * The trace is dormant by default and does not affect normal operation.
+ */
+void acquisition_mt_trace_set_enabled(bool enabled);
+bool acquisition_mt_trace_pop(mt_trace_event_t *out_event);
+uint32_t acquisition_mt_trace_dropped(void);
+
+/*
+ * Core 0 control-task instrumentation hooks.
+ *
+ * The real project control task calls these when it enters/leaves its
+ * runnable service loop. When proof mode is enabled, the next re-entry after
+ * acquisition completes emits a CTRL_RESUME marker.
+ */
+void acquisition_mt_trace_ctrl_enter(void);
+void acquisition_mt_trace_ctrl_exit(void);

@@ -1,7 +1,7 @@
 #include "processing.h"
+#include "acquisition.h"
 #include "filters.h"
 #include "motor_control.h"
-#include "led_status.h"
 #include "calibration.h"
 #include "nvs_storage.h"
 
@@ -15,6 +15,7 @@
 /* esp-dsp not required: f95 uses a self-contained DFT (see compute_f95 below) */
 
 #include <math.h>
+#include <inttypes.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -22,8 +23,9 @@ static const char *TAG = "PROC";
 
 /* ── Module state ─────────────────────────────────────────────────────── */
 static QueueHandle_t  s_raw_q;
-static QueueHandle_t  s_uart_q;
+static QueueHandle_t  s_ctrl_q;
 static cal_params_t  *s_cal;
+static volatile bool  s_mt_mode_enabled = false;
 
 /* GPIO toggle state for Core 1 debug pin */
 static int s_dbg_state = 0;
@@ -97,6 +99,33 @@ static int s_err_force_dur_cnt  = 0;
 /* ── Running score ───────────────────────────────────────────────────── */
 static float s_score = 100.0f;
 
+#define MT_CYCLE_RING_SIZE        8
+#define MT_COMPLETE_HISTORY_SIZE 32
+
+typedef struct {
+    bool     in_use;
+    bool     complete;
+    uint32_t cycle_id;
+    uint32_t ctrl_running_before_timer;
+    int64_t  t_timer_cb_begin_us;
+    int64_t  t_sem_give_us;
+    int64_t  t_acq_wake_us;
+    int64_t  t_acq_done_us;
+    int64_t  t_ctrl_resume_us;
+} mt_cycle_trace_t;
+
+typedef struct {
+    mt_cycle_trace_t cycles[MT_CYCLE_RING_SIZE];
+    mt_cycle_trace_t history[MT_COMPLETE_HISTORY_SIZE];
+    uint32_t         history_count;
+    uint32_t         history_head;
+    uint32_t         cycle_miss;
+    bool             have_latest;
+    mt_cycle_trace_t latest;
+} mt_trace_state_t;
+
+static mt_trace_state_t s_mt_trace_state;
+
 /* ── Helpers ────────────────────────────────────────────────────────── */
 static void reset_session_metrics(void)
 {
@@ -130,6 +159,210 @@ static void reset_session_metrics(void)
         filter_bp_6_12hz_init(&s_bp_tremor[i]);
     }
     filter_diff5_init(&s_diff5_fsr);
+}
+
+static void mt_trace_state_reset(void)
+{
+    memset(&s_mt_trace_state, 0, sizeof(s_mt_trace_state));
+}
+
+static mt_cycle_trace_t *mt_trace_find_cycle(uint32_t cycle_id, bool create)
+{
+    mt_cycle_trace_t *free_slot = NULL;
+
+    for (int i = 0; i < MT_CYCLE_RING_SIZE; i++) {
+        mt_cycle_trace_t *slot = &s_mt_trace_state.cycles[i];
+        if (slot->in_use && slot->cycle_id == cycle_id) {
+            return slot;
+        }
+        if (!slot->in_use && free_slot == NULL) {
+            free_slot = slot;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    if (free_slot != NULL) {
+        memset(free_slot, 0, sizeof(*free_slot));
+        free_slot->in_use = true;
+        free_slot->cycle_id = cycle_id;
+        return free_slot;
+    }
+
+    uint32_t oldest_idx = 0;
+    uint32_t oldest_cycle_id = UINT32_MAX;
+    for (uint32_t i = 0; i < MT_CYCLE_RING_SIZE; i++) {
+        if (s_mt_trace_state.cycles[i].cycle_id < oldest_cycle_id) {
+            oldest_cycle_id = s_mt_trace_state.cycles[i].cycle_id;
+            oldest_idx = i;
+        }
+    }
+
+    mt_cycle_trace_t *slot = &s_mt_trace_state.cycles[oldest_idx];
+    if (!slot->complete) {
+        s_mt_trace_state.cycle_miss++;
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->in_use = true;
+    slot->cycle_id = cycle_id;
+    return slot;
+}
+
+static void mt_trace_complete_cycle(mt_cycle_trace_t *cycle)
+{
+    if (cycle == NULL || cycle->complete) {
+        return;
+    }
+
+    cycle->complete = true;
+    s_mt_trace_state.latest = *cycle;
+    s_mt_trace_state.have_latest = true;
+    s_mt_trace_state.history[s_mt_trace_state.history_head] = *cycle;
+    s_mt_trace_state.history_head =
+        (s_mt_trace_state.history_head + 1u) % MT_COMPLETE_HISTORY_SIZE;
+    if (s_mt_trace_state.history_count < MT_COMPLETE_HISTORY_SIZE) {
+        s_mt_trace_state.history_count++;
+    }
+
+    cycle->in_use = false;
+}
+
+static void mt_trace_collect_stats(double   *period_us_avg,
+                                   double   *jitter_us,
+                                   double   *wake_us_avg,
+                                   double   *acq_us_avg,
+                                   double   *ctrl_resume_us_avg,
+                                   double   *ctrl_ratio,
+                                   uint32_t *sample_count)
+{
+    double prev_tb = 0.0;
+    double period_sum = 0.0;
+    double period_sum_sq = 0.0;
+    uint32_t period_n = 0;
+    double wake_sum = 0.0;
+    double acq_sum = 0.0;
+    double ctrl_sum = 0.0;
+    double ctrl_true = 0.0;
+    uint32_t n = s_mt_trace_state.history_count;
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t idx = (s_mt_trace_state.history_head + MT_COMPLETE_HISTORY_SIZE - n + i)
+                       % MT_COMPLETE_HISTORY_SIZE;
+        const mt_cycle_trace_t *c = &s_mt_trace_state.history[idx];
+        if (!c->complete) {
+            continue;
+        }
+        if (prev_tb > 0.0) {
+            double period = (double)(c->t_timer_cb_begin_us - (int64_t)prev_tb);
+            period_sum += period;
+            period_sum_sq += period * period;
+            period_n++;
+        }
+        prev_tb = (double)c->t_timer_cb_begin_us;
+        wake_sum += (double)(c->t_acq_wake_us - c->t_timer_cb_begin_us);
+        acq_sum += (double)(c->t_acq_done_us - c->t_acq_wake_us);
+        ctrl_sum += (double)(c->t_ctrl_resume_us - c->t_acq_done_us);
+        ctrl_true += c->ctrl_running_before_timer ? 1.0 : 0.0;
+    }
+
+    *sample_count = n;
+    *period_us_avg = (period_n > 0) ? (period_sum / (double)period_n) : 0.0;
+    if (period_n > 1) {
+        double mean = *period_us_avg;
+        double variance = (period_sum_sq / (double)period_n) - (mean * mean);
+        *jitter_us = (variance > 0.0) ? sqrt(variance) : 0.0;
+    } else {
+        *jitter_us = 0.0;
+    }
+    *wake_us_avg = (n > 0) ? (wake_sum / (double)n) : 0.0;
+    *acq_us_avg = (n > 0) ? (acq_sum / (double)n) : 0.0;
+    *ctrl_resume_us_avg = (n > 0) ? (ctrl_sum / (double)n) : 0.0;
+    *ctrl_ratio = (n > 0) ? (ctrl_true / (double)n) : 0.0;
+}
+
+static void mt_trace_emit_snapshot(void)
+{
+    if (!s_mt_trace_state.have_latest) {
+        return;
+    }
+
+    double period_us = 0.0;
+    double jitter_us = 0.0;
+    double wake_us = 0.0;
+    double acq_us = 0.0;
+    double ctrl_resume_us = 0.0;
+    double ctrl_ratio = 0.0;
+    uint32_t n = 0;
+    char buf[384];
+
+    mt_trace_collect_stats(&period_us, &jitter_us, &wake_us,
+                           &acq_us, &ctrl_resume_us, &ctrl_ratio, &n);
+
+    const mt_cycle_trace_t *c = &s_mt_trace_state.latest;
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"mt\":\"SN\",\"latest\":{\"ctrl\":%" PRIu32 ",\"tb\":%" PRId64 ",\"sg\":%" PRId64
+                       ",\"aw\":%" PRId64 ",\"ad\":%" PRId64 ",\"cr\":%" PRId64 "},"
+                       "\"stats\":{\"period_us\":%.1f,\"jitter_us\":%.1f,\"wake_us\":%.1f,"
+                       "\"acq_us\":%.1f,\"ctrl_resume_us\":%.1f,\"ctrl_ratio\":%.3f,\"n\":%u},"
+                       "\"health\":{\"trace_drop\":%lu,\"cycle_miss\":%lu}}\r\n",
+                       c->ctrl_running_before_timer,
+                       c->t_timer_cb_begin_us,
+                       c->t_sem_give_us,
+                       c->t_acq_wake_us,
+                       c->t_acq_done_us,
+                       c->t_ctrl_resume_us,
+                       period_us, jitter_us, wake_us, acq_us, ctrl_resume_us,
+                       ctrl_ratio, (unsigned)n,
+                       (unsigned long)acquisition_mt_trace_dropped(),
+                       (unsigned long)s_mt_trace_state.cycle_miss);
+    if (len > 0) {
+        uart_write_bytes(UART_NUM_0, buf, (size_t)len);
+    }
+}
+
+static void mt_trace_drain_events(void)
+{
+    mt_trace_event_t ev;
+
+    while (acquisition_mt_trace_pop(&ev)) {
+        mt_cycle_trace_t *cycle = mt_trace_find_cycle(ev.cycle_id, ev.code == MT_TRACE_TIMER_CB_BEGIN);
+        if (cycle == NULL) {
+            s_mt_trace_state.cycle_miss++;
+            continue;
+        }
+
+        switch (ev.code) {
+        case MT_TRACE_TIMER_CB_BEGIN:
+            cycle->ctrl_running_before_timer = ev.aux;
+            cycle->t_timer_cb_begin_us = ev.t_us;
+            break;
+        case MT_TRACE_SEM_GIVE:
+            cycle->t_sem_give_us = ev.t_us;
+            break;
+        case MT_TRACE_ACQ_WAKE:
+            cycle->t_acq_wake_us = ev.t_us;
+            break;
+        case MT_TRACE_ACQ_DONE:
+            cycle->t_acq_done_us = ev.t_us;
+            break;
+        case MT_TRACE_CTRL_RESUME:
+            cycle->t_ctrl_resume_us = ev.t_us;
+            if (cycle->t_timer_cb_begin_us > 0 &&
+                cycle->t_sem_give_us > 0 &&
+                cycle->t_acq_wake_us > 0 &&
+                cycle->t_acq_done_us > 0) {
+                mt_trace_complete_cycle(cycle);
+            } else {
+                s_mt_trace_state.cycle_miss++;
+                cycle->in_use = false;
+            }
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 static float tremor_baseline_dps(void)
@@ -330,109 +563,107 @@ static void update_contact(int i, float fsr_filtered)
     }
 }
 
-/* ── UART command dispatch ────────────────────────────────────────────── */
-static void dispatch_command(const char *cmd, int len)
+static void apply_difficulty(float warn_force_scale,
+                             float err_force_scale,
+                             float warn_tremor_excess_dps,
+                             float err_tremor_excess_dps,
+                             float warn_tremor_ratio,
+                             float err_tremor_ratio)
 {
-    if (len <= 0) {
+    reset_session_metrics();
+    s_warn_sum_n = s_cal->f_ref_open * warn_force_scale;
+    s_err_sum_n  = s_cal->f_ref_open * err_force_scale;
+    s_warn_tremor_excess_dps = warn_tremor_excess_dps;
+    s_err_tremor_excess_dps  = err_tremor_excess_dps;
+    s_warn_tremor_ratio = warn_tremor_ratio;
+    s_err_tremor_ratio  = err_tremor_ratio;
+}
+
+static void handle_control_msg(const processing_control_msg_t *msg)
+{
+    if (msg == NULL) {
         return;
     }
 
-    char response[64];
-
-    /* Multi-byte commands first */
-    if (len >= 5 && strncmp(cmd, "C3_REP", 6) == 0) {
-        led_status_blink_hz(30);
-        calibration_c3_rep(s_raw_q, s_cal);
-        return;
-    }
-    if (len >= 8 && strncmp(cmd, "C4_CYCLE", 8) == 0) {
-        led_status_blink_hz(30);
-        calibration_c4_cycle(s_raw_q, s_cal);
-        return;
-    }
-    if (len >= 2 && cmd[0] == 'C' && cmd[1] >= '1' && cmd[1] <= '4') {
-        led_status_blink_hz(30);
-        calibration_run(cmd[1], s_raw_q, s_cal);
-        return;
-    }
-
-    /* Single-byte commands */
-    switch (cmd[0]) {
-    case 'I':
-        led_status_solid_on();
+    switch (msg->cmd) {
+    case PROCESSING_CTRL_IDENTIFY:
         uart_write_bytes(UART_NUM_0, "ESP32_TRAINER\r\n", 15);
         uart_write_bytes(UART_NUM_0, "READY: fw=v1.0 proto=cal-v3\r\n", 31);
         break;
-    case 'S':
-        led_status_off();
+    case PROCESSING_CTRL_STOP:
         s_state    = BOARD_IDLE;
         s_hold_cnt = 0;
         uart_write_bytes(UART_NUM_0, "STOPPED\r\n", 9);
         break;
-    case 'E':
-        led_status_blink_hz(1);
-        reset_session_metrics();
-        s_warn_sum_n = s_cal->f_ref_open * FORCE_EASY_WARN_X;
-        s_err_sum_n  = s_cal->f_ref_open * FORCE_EASY_ERR_X;
-        s_warn_tremor_excess_dps = TREMOR_EASY_WARN_EXCESS_DPS;
-        s_err_tremor_excess_dps  = TREMOR_EASY_ERR_EXCESS_DPS;
-        s_warn_tremor_ratio = TREMOR_EASY_WARN_RATIO;
-        s_err_tremor_ratio  = TREMOR_EASY_ERR_RATIO;
+    case PROCESSING_CTRL_SET_EASY:
+        apply_difficulty(FORCE_EASY_WARN_X,
+                         FORCE_EASY_ERR_X,
+                         TREMOR_EASY_WARN_EXCESS_DPS,
+                         TREMOR_EASY_ERR_EXCESS_DPS,
+                         TREMOR_EASY_WARN_RATIO,
+                         TREMOR_EASY_ERR_RATIO);
         uart_write_bytes(UART_NUM_0, "EASY\r\n", 6);
         break;
-    case 'M':
-        led_status_blink_hz(2);
-        reset_session_metrics();
-        s_warn_sum_n = s_cal->f_ref_open * FORCE_MED_WARN_X;
-        s_err_sum_n  = s_cal->f_ref_open * FORCE_MED_ERR_X;
-        s_warn_tremor_excess_dps = TREMOR_MED_WARN_EXCESS_DPS;
-        s_err_tremor_excess_dps  = TREMOR_MED_ERR_EXCESS_DPS;
-        s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
-        s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
+    case PROCESSING_CTRL_SET_MEDIUM:
+        apply_difficulty(FORCE_MED_WARN_X,
+                         FORCE_MED_ERR_X,
+                         TREMOR_MED_WARN_EXCESS_DPS,
+                         TREMOR_MED_ERR_EXCESS_DPS,
+                         TREMOR_MED_WARN_RATIO,
+                         TREMOR_MED_ERR_RATIO);
         uart_write_bytes(UART_NUM_0, "INTERMEDIATE\r\n", 14);
         break;
-    case 'H':
-        led_status_blink_hz(4);
-        reset_session_metrics();
-        s_warn_sum_n = s_cal->f_ref_open * FORCE_HARD_WARN_X;
-        s_err_sum_n  = s_cal->f_ref_open * FORCE_HARD_ERR_X;
-        s_warn_tremor_excess_dps = TREMOR_HARD_WARN_EXCESS_DPS;
-        s_err_tremor_excess_dps  = TREMOR_HARD_ERR_EXCESS_DPS;
-        s_warn_tremor_ratio = TREMOR_HARD_WARN_RATIO;
-        s_err_tremor_ratio  = TREMOR_HARD_ERR_RATIO;
+    case PROCESSING_CTRL_SET_HARD:
+        apply_difficulty(FORCE_HARD_WARN_X,
+                         FORCE_HARD_ERR_X,
+                         TREMOR_HARD_WARN_EXCESS_DPS,
+                         TREMOR_HARD_ERR_EXCESS_DPS,
+                         TREMOR_HARD_WARN_RATIO,
+                         TREMOR_HARD_ERR_RATIO);
         uart_write_bytes(UART_NUM_0, "HARD\r\n", 6);
         break;
-    case 'X':
-        led_status_off();
-        uart_write_bytes(UART_NUM_0, "EXITED\r\n", 8);
+    case PROCESSING_CTRL_EXIT:
         s_state = BOARD_EXITED;
-        /* Suspend self — acquisition task continues, motors off */
-        motor_control_init(); /* drives all motors LOW */
-        vTaskSuspend(NULL);
+        motor_control_init();
+        uart_write_bytes(UART_NUM_0, "EXITED\r\n", 8);
         break;
-    case 'Z':
+    case PROCESSING_CTRL_RESET_CAL:
         nvs_erase_calibration();
         nvs_get_defaults(s_cal);
         uart_write_bytes(UART_NUM_0, "{\"nvs\":\"ERASED\"}\r\n", 18);
         break;
-    default: {
-        int n = snprintf(response, sizeof(response),
-                         "{\"err\":\"unknown_cmd\",\"cmd\":\"%c\"}\r\n", cmd[0]);
-        uart_write_bytes(UART_NUM_0, response, (size_t)n);
+    case PROCESSING_CTRL_CAL_RUN_STEP:
+        calibration_run(msg->step, s_raw_q, s_cal);
+        break;
+    case PROCESSING_CTRL_CAL_C3_REP:
+        calibration_c3_rep(s_raw_q, s_cal);
+        break;
+    case PROCESSING_CTRL_CAL_C4_CYCLE:
+        calibration_c4_cycle(s_raw_q, s_cal);
+        break;
+    default:
         break;
     }
+}
+
+static void drain_control_queue(void)
+{
+    processing_control_msg_t msg;
+
+    while (s_ctrl_q != NULL && xQueueReceive(s_ctrl_q, &msg, 0) == pdTRUE) {
+        handle_control_msg(&msg);
     }
 }
 
 /* ── Public API ────────────────────────────────────────────────────────── */
 
 void processing_init(QueueHandle_t raw_q,
-                     QueueHandle_t uart_event_q,
                      cal_params_t  *cal)
 {
     s_raw_q  = raw_q;
-    s_uart_q = uart_event_q;
     s_cal    = cal;
+    s_ctrl_q = xQueueCreate(8, sizeof(processing_control_msg_t));
+    configASSERT(s_ctrl_q != NULL);
 
     /* Initialize all filter states */
     for (int i = 0; i < 3; i++) {
@@ -464,6 +695,21 @@ void processing_init(QueueHandle_t raw_q,
     s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
     s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
 
+}
+
+bool processing_submit_control(const processing_control_msg_t *msg,
+                               TickType_t                     timeout_ticks)
+{
+    if (msg == NULL || s_ctrl_q == NULL) {
+        return false;
+    }
+    return xQueueSend(s_ctrl_q, msg, timeout_ticks) == pdTRUE;
+}
+
+void processing_set_mt_mode(bool enabled)
+{
+    s_mt_mode_enabled = enabled;
+    mt_trace_state_reset();
 }
 
 void processing_tremor_baseline_reset(void)
@@ -506,6 +752,11 @@ void processing_task(void *arg)
     int sample_count = 0;
 
     for (;;) {
+        drain_control_queue();
+        if (s_mt_mode_enabled) {
+            mt_trace_drain_events();
+        }
+
         /*
          * Block here until Core 0 posts a raw_sample_t.
          * portMAX_DELAY means wait forever — the task is scheduled out
@@ -744,24 +995,16 @@ void processing_task(void *arg)
         if (warn_flags) s_score = (s_score > 0.2f) ? s_score - 0.2f : 0.0f;
         if (err_flags)  s_score = (s_score > 0.5f) ? s_score - 0.5f : 0.0f;
 
-        /* ── 10. Check for UART commands (non-blocking) ────────────── */
-        uart_event_t ev;
-        if (xQueueReceive(s_uart_q, &ev, 0) == pdTRUE) {
-            if (ev.type == UART_DATA) {
-                uint8_t cmd_buf[32];
-                memset(cmd_buf, 0, sizeof(cmd_buf));
-                int n_read = uart_read_bytes(UART_NUM_0, cmd_buf,
-                                             (ev.size < 31) ? (uint32_t)ev.size : 31U,
-                                             0);
-                if (n_read > 0) {
-                    dispatch_command((char *)cmd_buf, n_read);
-                }
-            }
+        drain_control_queue();
+        if (s_mt_mode_enabled) {
+            mt_trace_drain_events();
         }
 
-        /* ── 11. JSON output every 5th sample (≈20 Hz) ────────────── */
+        /* ── 10. JSON output every 5th sample (≈20 Hz) ────────────── */
         sample_count++;
-        if (sample_count % 5 == 0) {
+        if (s_mt_mode_enabled && sample_count % 5 == 0) {
+            mt_trace_emit_snapshot();
+        } else if (!s_mt_mode_enabled && sample_count % 5 == 0) {
             char buf[640];
             int n = snprintf(buf, sizeof(buf),
                 "{\"t\":%lld"

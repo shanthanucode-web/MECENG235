@@ -275,24 +275,25 @@ motor pulse calls, but `MOTORS_ENABLED` is set to `0` in `main/data_types.h`. Th
 
 The firmware is divided into two responsibilities:
 
-- **Core 0** acquires data on time
-- **Core 1** processes data and handles host interaction
+- **Core 0** owns the real-time acquisition path and the low-priority control plane
+- **Core 1** processes sensor data
 
 ### The actual task split
 
 ```text
-CORE 0 (acquisition)
+CORE 0
   esp_timer callback -> semaphore
   acquisition_task wakes
   reads ADC + IMU
   posts raw_sample_t to queue
+  control_task handles UART0 command ingress
+  control_task coordinates host commands and proof-mode state
 
-CORE 1 (processing)
+CORE 1
   processing_task waits on queue
   filters and interprets sample
   updates warnings, errors, score, and state
-  sends JSON to host
-  receives UART0 command events
+  sends JSON and proof snapshots to the host
 ```
 
 ### Why this matters
@@ -377,34 +378,44 @@ This project should also be explained in class terms:
 
 ### How multitasking appears in this project
 
-FreeRTOS provides multiple tasks:
+FreeRTOS provides multiple real tasks in the project itself:
 
 - `acquisition_task`
+- `control_task`
 - `processing_task`
 - background framework tasks such as the timer task and UART driver support
 
-On top of that, the ESP32 has two physical cores. The code pins the main application
-tasks to different cores with `xTaskCreatePinnedToCore`.
+The important class-definition example is on **Core 0**:
+
+- `control_task` is a real low-priority project task
+- the ESP-IDF `esp_timer` dispatch task runs at higher priority
+- `acquisition_task` wakes at priority 10 every 10 ms
+
+That means a lower-priority **project-owned** task is genuinely interrupted by
+higher-priority work on the same CPU core.
 
 ### Why that distinction matters
 
-FreeRTOS gives the project a multitasking model. The dual-core ESP32 turns the two main
-application paths into genuine parallel execution:
+FreeRTOS gives the project a multitasking model. The dual-core ESP32 also turns the two
+main application paths into genuine parallel execution:
 
-- acquisition on Core 0
+- acquisition + control on Core 0
 - processing on Core 1
 
 So the system is both:
 
-- a multitasking system in the software sense
+- a multitasking system in the software sense, because Core 0 has
+  priority-based interruption between real tasks
 - a parallel dual-core design in the hardware sense
 
 ### Why the professor will care
 
 If you present this project, the correct phrasing is:
 
-- multitasking is provided by FreeRTOS tasks
-- the dual-core ESP32 lets the two critical tasks run in parallel
+- multitasking is demonstrated on Core 0, where the low-priority `control_task`
+  is interrupted by higher-priority timer/acquisition work
+- the dual-core ESP32 separately lets the acquisition/control side and the
+  processing side run in parallel
 - the queue is the synchronization boundary between them
 
 Do not reduce the explanation to "it uses two cores, so it is multitasking." That is
@@ -427,8 +438,8 @@ Start here if you want the top-level picture.
 - initializes acquisition support
 - initializes LED and motor subsystems
 - installs the UART0 driver and gets its event queue
-- initializes processing with the sample queue, UART event queue, and calibration pointer
-- creates the two pinned tasks
+- initializes processing and control modules
+- creates the three pinned tasks
 - prints a `READY` line to the host
 
 If you want to understand how the application is assembled, `main.c` is the entry point.
@@ -439,7 +450,7 @@ Jump into code:
 - `app_main()` starts around line 29
 - queue creation is around lines 58-74
 - UART0 driver install is around lines 81-103
-- `xTaskCreatePinnedToCore(...)` calls are around lines 134-148
+- `xTaskCreatePinnedToCore(...)` calls are around lines 143-166
 
 ### 2. `main/acquisition.c` and `main/acquisition.h` — Core 0 data acquisition
 
@@ -473,7 +484,30 @@ Jump into code:
 - the ADC-to-force sampling loop is around lines 282-290
 - the UART-RVC read and gyro derivation logic is around lines 299-321
 
-### 3. `main/processing.c` and `main/processing.h` — Core 1 interpretation
+### 3. `main/control.c` and `main/control.h` — Core 0 control plane
+
+This subsystem is the low-priority project task that makes the multitasking story
+defensible in class terms.
+
+Key responsibilities:
+
+- read UART0 command events from the driver queue
+- parse host commands like `I`, `E`, `C1`, `MT_ON`, and `Z`
+- coordinate those commands with the Core 1 processing task
+- mark the real low-priority control-plane activity that proof mode instruments
+
+This task is necessary even outside proof mode because the host control plane needs a
+home that is separate from both the hard real-time acquisition path and the heavier
+Core 1 signal-processing path.
+
+Jump into code:
+
+- [`main/control.c`](main/control.c) — control-plane implementation
+- [`main/control.h`](main/control.h) — control-plane interface
+- `dispatch_command(...)` starts around line 119
+- `control_task()` starts around line 229
+
+### 4. `main/processing.c` and `main/processing.h` — Core 1 interpretation
 
 This is the brain of the runtime system.
 
@@ -486,7 +520,6 @@ Key responsibilities:
 - apply warning and error logic
 - update the score
 - emit JSON telemetry
-- parse UART0 commands from the host
 
 If you are trying to change scoring, thresholds, warning behavior, or telemetry, this is
 the file you will spend the most time in.
@@ -495,14 +528,14 @@ Jump into code:
 
 - [`main/processing.c`](main/processing.c) — runtime logic
 - [`main/processing.h`](main/processing.h) — module interface
-- `processing_init(...)` starts around line 430
-- `processing_task()` starts around line 500
-- per-axis tremor band-pass filtering is around lines 542-550
-- engagement and board-state logic is around lines 608-663
-- warning/error logic starts around line 665
-- JSON telemetry formatting starts around line 762
+- `processing_init(...)` starts around line 421
+- `processing_task()` starts around line 506
+- per-axis tremor band-pass filtering is around lines 558-566
+- engagement and board-state logic is around lines 624-679
+- warning/error logic starts around line 681
+- JSON telemetry formatting starts around line 843
 
-### 4. `main/calibration.c` and `main/calibration.h` — guided personalization
+### 5. `main/calibration.c` and `main/calibration.h` — guided personalization
 
 This subsystem captures the reference values that make the runtime logic user-specific.
 
@@ -866,7 +899,7 @@ That is a deliberate bandwidth decision:
 The project has three important asynchronous/event-driven paths:
 
 1. `esp_timer` callback -> gives `s_timer_sem`
-2. UART0 driver -> posts `UART_DATA` events to `uart_event_q`
+2. UART0 driver -> posts `UART_DATA` events to `uart_event_q`, consumed by `control_task`
 3. BNO085 UART-RVC -> read directly by `acquisition_task` each cycle
 
 That third point matters because the IMU path is **not** currently modeled as a UART2
@@ -989,6 +1022,70 @@ python tests/dual_core_monitor.py --port /dev/cu.usbserial-XXXX
 ```
 
 This helps validate timing stability and host-observed telemetry behavior.
+
+### Multitasking proof dashboard
+
+```bash
+python3 tests/multitask_proof.py
+python3 tests/multitask_proof.py --port /dev/cu.usbserial-XXXX
+```
+
+Use this during the presentation to prove the class-definition multitasking path on
+Core 0. The script auto-detects a likely ESP32 port by default and shows a short
+chooser if several plausible ports are present.
+
+In proof mode, the firmware instruments the real always-on Core 0 `control_task`.
+That task already exists in the project because UART command ingress and host control
+should not live inside the hard-real-time acquisition loop. Raw proof events are
+captured on Core 0, but proof snapshots are assembled and serialized from Core 1 so
+the proof mechanism does not distort the Core 0 control task it is trying to prove.
+The dashboard shows that this real project task is running, then gets interrupted by
+higher-priority timer-dispatch work and `acquisition_task`, and then resumes.
+
+Demo day sequence:
+
+1. flash the current firmware
+2. run `python3 tests/multitask_proof.py`
+3. let the script send `MT_ON`
+4. point to the `Proof Snapshot` block first
+5. point to `CTRL -> T -> S -> W -> D -> CTRL`
+6. explain that the first `CTRL` means the real low-priority `control_task` was running before the interrupt, and the second `CTRL` means it resumed after acquisition finished
+7. exit with `Ctrl+C`, which sends `MT_OFF`
+
+Default dashboard reading order:
+
+- `Proof Snapshot` gives the four key numbers:
+  - timer period
+  - timer -> acquisition wake latency
+  - acquisition runtime
+  - acquisition done -> control-task resume latency
+- `Proof Health` shows whether any raw trace events or whole cycles were lost
+- `Latest Core 0 Timeline` shows the event order for the most recent cycle
+- `Status` keeps only the supporting context needed during the presentation
+
+What the event chain means:
+
+- `CTRL -> T -> S -> W -> D -> CTRL`
+- first `CTRL` = the real low-priority Core 0 `control_task` was running
+- `T` = timer callback begins in the `esp_timer` dispatch context
+- `S` = semaphore is given
+- `W` = `acquisition_task` wakes and runs
+- `D` = acquisition finishes its cycle
+- second `CTRL` = the same real Core 0 `control_task` resumed after acquisition
+
+This dashboard is live firmware instrumentation of direct same-core interruption and
+resume behavior. It is not a simulated timeline. The period and jitter values shown in
+the dashboard come from assembled firmware cycle timing, not from inter-packet arrival
+spacing on the host.
+
+If you need the more detailed diagnostic layout, run:
+
+```bash
+python3 tests/multitask_proof.py --verbose
+```
+
+While proof mode is active, normal runtime JSON is intentionally suppressed so the
+UART stream stays clean and presentation-friendly.
 
 ---
 

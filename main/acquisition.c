@@ -25,6 +25,7 @@ static const char *TAG = "ACQ";
 /* ── Module state ──────────────────────────────────────────────────────── */
 static QueueHandle_t             s_out_q;
 static SemaphoreHandle_t         s_timer_sem;
+static QueueHandle_t             s_mt_trace_q;
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cali;
@@ -40,6 +41,16 @@ static volatile int s_freq_state = 0;
 static char s_diag_buf[512];
 static int  s_diag_len = 0;
 
+#define MT_TRACE_QUEUE_DEPTH  128
+
+static volatile bool     s_mt_trace_enabled = false;
+static volatile uint32_t s_mt_trace_seq = 0;
+static volatile uint32_t s_mt_trace_dropped = 0;
+static volatile uint32_t s_mt_cycle_id = 0;
+static volatile bool     s_mt_ctrl_running = false;
+static volatile bool     s_mt_ctrl_resume_armed = false;
+static volatile uint32_t s_mt_resume_cycle_id = 0;
+
 static void diag_append(const char *fmt, ...)
 {
     int remaining = (int)sizeof(s_diag_buf) - s_diag_len;
@@ -53,6 +64,34 @@ static void diag_append(const char *fmt, ...)
     if (n > 0) {
         s_diag_len += (n < remaining) ? n : (remaining - 1);
     }
+}
+
+static void mt_trace_emit_ex(mt_trace_event_code_t code,
+                             uint32_t              cycle_id,
+                             uint32_t              aux)
+{
+    if (!s_mt_trace_enabled || s_mt_trace_q == NULL) {
+        return;
+    }
+
+    mt_trace_event_t ev = {
+        .seq = __atomic_add_fetch(&s_mt_trace_seq, 1u, __ATOMIC_RELAXED),
+        .cycle_id = cycle_id,
+        .t_us = esp_timer_get_time(),
+        .core_id = (uint8_t)xPortGetCoreID(),
+        .code = code,
+        .aux = aux,
+    };
+
+    if (xQueueSend(s_mt_trace_q, &ev, 0) != pdTRUE) {
+        __atomic_add_fetch(&s_mt_trace_dropped, 1u, __ATOMIC_RELAXED);
+    }
+}
+
+static void mt_trace_emit(mt_trace_event_code_t code)
+{
+    uint32_t cycle_id = __atomic_load_n(&s_mt_cycle_id, __ATOMIC_RELAXED);
+    mt_trace_emit_ex(code, cycle_id, 0u);
 }
 
 /* ── FSR 402 voltage → Newton lookup table ─────────────────────────────── */
@@ -93,9 +132,13 @@ static float fsr402_mv_to_newton(float v_mv)
 static void timer_isr_cb(void *arg)
 {
     (void)arg;
+    uint32_t cycle_id = __atomic_add_fetch(&s_mt_cycle_id, 1u, __ATOMIC_RELAXED);
+    bool ctrl_running = s_mt_ctrl_running;
+    mt_trace_emit_ex(MT_TRACE_TIMER_CB_BEGIN, cycle_id, ctrl_running ? 1u : 0u);
     s_freq_state ^= 1;
     gpio_set_level(GPIO_FREQ_PROOF, s_freq_state);
     xSemaphoreGive(s_timer_sem);
+    mt_trace_emit_ex(MT_TRACE_SEM_GIVE, cycle_id, 0u);
 }
 
 /* ── UART-RVC 19-byte packet reader ─────────────────────────────────────── */
@@ -201,6 +244,9 @@ esp_err_t acquisition_init(QueueHandle_t out_queue)
     s_timer_sem = xSemaphoreCreateBinary();
     configASSERT(s_timer_sem);
 
+    s_mt_trace_q = xQueueCreate(MT_TRACE_QUEUE_DEPTH, sizeof(mt_trace_event_t));
+    configASSERT(s_mt_trace_q);
+
     gpio_reset_pin(GPIO_FREQ_PROOF);
     gpio_set_direction(GPIO_FREQ_PROOF, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_FREQ_PROOF, 0);
@@ -274,6 +320,7 @@ void acquisition_task(void *arg)
          * STEP 1 — wait for 100 Hz timer tick.
          */
         xSemaphoreTake(s_timer_sem, portMAX_DELAY);
+        mt_trace_emit(MT_TRACE_ACQ_WAKE);
 
         raw_sample_t samp;
         memset(&samp, 0, sizeof(samp));
@@ -340,5 +387,58 @@ void acquisition_task(void *arg)
             last_rate_t = now;
             rate_cnt    = 0;
         }
+
+        s_mt_resume_cycle_id = __atomic_load_n(&s_mt_cycle_id, __ATOMIC_RELAXED);
+        s_mt_ctrl_resume_armed = true;
+        mt_trace_emit(MT_TRACE_ACQ_DONE);
     }
+}
+
+void acquisition_mt_trace_set_enabled(bool enabled)
+{
+    s_mt_trace_enabled = false;
+    s_mt_ctrl_running = false;
+    s_mt_ctrl_resume_armed = false;
+
+    if (s_mt_trace_q != NULL) {
+        xQueueReset(s_mt_trace_q);
+    }
+
+    __atomic_store_n(&s_mt_trace_seq, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_mt_trace_dropped, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_mt_cycle_id, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_mt_resume_cycle_id, 0u, __ATOMIC_RELAXED);
+
+    if (enabled) {
+        s_mt_trace_enabled = true;
+    }
+}
+
+bool acquisition_mt_trace_pop(mt_trace_event_t *out_event)
+{
+    if (out_event == NULL || s_mt_trace_q == NULL) {
+        return false;
+    }
+    return xQueueReceive(s_mt_trace_q, out_event, 0) == pdTRUE;
+}
+
+uint32_t acquisition_mt_trace_dropped(void)
+{
+    return __atomic_load_n(&s_mt_trace_dropped, __ATOMIC_RELAXED);
+}
+
+void acquisition_mt_trace_ctrl_enter(void)
+{
+    s_mt_ctrl_running = true;
+
+    if (s_mt_trace_enabled && s_mt_ctrl_resume_armed) {
+        uint32_t cycle_id = __atomic_load_n(&s_mt_resume_cycle_id, __ATOMIC_RELAXED);
+        s_mt_ctrl_resume_armed = false;
+        mt_trace_emit_ex(MT_TRACE_CTRL_RESUME, cycle_id, 0u);
+    }
+}
+
+void acquisition_mt_trace_ctrl_exit(void)
+{
+    s_mt_ctrl_running = false;
 }

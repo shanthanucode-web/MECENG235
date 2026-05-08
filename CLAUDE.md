@@ -37,7 +37,8 @@ main/
   main.c               — app_main: queue creation, hardware init, task pinning
   data_types.h         — shared structs (raw_sample_t, cal_params_t) and all #defines
   acquisition.c/.h     — Core 0: 100 Hz timer, ADC (FSR × 3), BNO085 UART-RVC, queue post
-  processing.c/.h      — Core 1: IIR filters, state machine, thresholds, JSON, commands
+  control.c/.h         — Core 0: UART0 command ingress, control-plane coordination, proof-mode control
+  processing.c/.h      — Core 1: IIR filters, state machine, thresholds, JSON, proof snapshot assembly
   calibration.c/.h     — calibration sub-state machine (C1–C4, NVS save)
   filters.c/.h         — Butterworth biquad IIR: LP 12 Hz, BP 6–12 Hz, LP 10 Hz
   motor_control.c/.h   — vibration motor GPIO pulse (MOTORS_ENABLED=0 by default)
@@ -63,7 +64,24 @@ This is confirmed at boot: `I (200) cpu_start: Multicore app`.
 | Task | Core | Stack | Priority | Role |
 |------|------|-------|----------|------|
 | `acq_task` | 0 (PRO) | 4096 B | 10 | ADC + IMU sampling at 100 Hz |
-| `proc_task` | 1 (APP) | 8192 B | 9  | Filtering, state machine, JSON output |
+| `ctrl_task` | 0 (PRO) | 4096 B | 1  | UART commands, control-plane coordination, proof-mode control |
+| `proc_task` | 1 (APP) | 12288 B | 9  | Filtering, state machine, JSON output, proof snapshots |
+
+This split matters:
+
+- **Core 0 real-time plane**: `esp_timer` dispatch task -> `acquisition_task`
+- **Core 0 control plane**: `control_task` at lower priority
+- **Core 1 compute plane**: `processing_task`
+
+For class-definition multitasking, the important story is on **Core 0**:
+
+- the real low-priority `control_task` is running
+- higher-priority timer-dispatch work begins
+- `acquisition_task` wakes and runs
+- `control_task` resumes afterward
+
+That is the same-core priority-based interruption chain. The Core 0/Core 1 split is a
+separate **parallelism** story.
 
 ### Inter-Core Communication
 
@@ -72,6 +90,10 @@ The only data path between cores is a **FreeRTOS queue** (`QueueHandle_t raw_q`,
 - Core 0 calls `xQueueSend(&samp, 0)` — non-blocking, drops oldest if full
 - Core 1 calls `xQueueReceive(&samp, portMAX_DELAY)` — blocks until data arrives
 - The queue copies `raw_sample_t` by value (no shared pointers, no mutex needed)
+
+There is also a small control queue internal to `processing.c` so the Core 0
+`control_task` can request state changes while processing-owned state stays single-threaded
+on Core 1.
 
 ### State Machine
 
@@ -84,9 +106,9 @@ Any state → `EXITED` (via X command)
 UART0, 115200 baud, GPIO 1=TX, GPIO 3=RX.
 
 **Commands (host → ESP32):** `I` (identify), `E` (easy), `M` (medium), `H` (hard),
-`S` (stop), `C1`–`C4` (calibration steps), `X` (exit), `Z` (erase NVS)
+`S` (stop), `C1`–`C4` (calibration steps), `X` (exit), `Z` (erase NVS), `MT_ON`, `MT_OFF`
 
-**Telemetry (ESP32 → host):** JSON at 20 Hz (every 5th sample of 100 Hz acquisition).
+**Runtime telemetry (ESP32 → host):** JSON at 20 Hz (every 5th sample of 100 Hz acquisition).
 All output via `uart_write_bytes()` directly — ESP_LOG is silenced after the startup
 banner to prevent log messages from fragmenting JSON lines.
 
@@ -99,8 +121,10 @@ Example JSON:
  "warn":0,"err":0,"score":100.0,"actual_hz":100.00}
 ```
 
-`actual_hz` is currently nominal in firmware JSON. For timing proof, use
-`tests/dual_core_monitor.py` or scope GPIO4/A5.
+**Multitasking proof telemetry:** when `MT_ON` is active, normal runtime JSON is
+suppressed and the firmware emits low-rate proof snapshots instead. Raw proof events are
+captured on Core 0, but snapshot assembly and UART serialization happen on Core 1 so the
+proof mechanism does not perturb the Core 0 control task it is trying to prove.
 
 ### BNO085 UART-RVC Mode
 
@@ -152,9 +176,31 @@ python tests/fsr_test.py --list-ports # list all serial ports
 python tests/fsr_test.py --log        # also write CSV log
 python tests/imu_test.py              # BNO085 UART-RVC diagnostic
 python tests/dual_core_monitor.py --port /dev/cu.usbserial-XXXX
+python tests/multitask_proof.py       # Core 0 multitasking proof dashboard
 ```
 
 Only one process can hold the serial port at a time. Stop `idf.py monitor` before running.
+
+### Multitasking Proof Dashboard
+
+`tests/multitask_proof.py` is the presentation-facing proof tool for the class definition
+of multitasking.
+
+What it proves:
+
+- the real low-priority Core 0 `control_task` was running before the interrupt
+- higher-priority timer-dispatch work ran
+- `acquisition_task` woke and ran
+- the same `control_task` resumed afterward
+
+The important on-screen outputs are:
+
+- `Proof Snapshot`
+- `CTRL -> T -> S -> W -> D -> CTRL`
+- `Proof Health`
+
+Trust the textual event chain and the health counters over any compressed visual sketch.
+The proof is only presentation-safe when `Trace drops = 0` and `Cycle misses = 0`.
 
 ---
 

@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "acquisition.c"
+        "control.c"
         "processing.c"
         "calibration.c"
         "filters.c"

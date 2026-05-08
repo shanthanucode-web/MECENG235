@@ -2,6 +2,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include <stdbool.h>
 #include "data_types.h"
 
 /*
@@ -32,22 +33,51 @@
  *     ↓
  *   Motor pulses (if MOTORS_ENABLED)
  *     ↓
- *   UART command poll (non-blocking, from uart_event_q)
- *     ↓
  *   JSON output every 5th sample (20 Hz) via uart_write_bytes
  */
+
+typedef enum {
+    PROCESSING_CTRL_IDENTIFY = 0,
+    PROCESSING_CTRL_STOP,
+    PROCESSING_CTRL_SET_EASY,
+    PROCESSING_CTRL_SET_MEDIUM,
+    PROCESSING_CTRL_SET_HARD,
+    PROCESSING_CTRL_EXIT,
+    PROCESSING_CTRL_RESET_CAL,
+    PROCESSING_CTRL_CAL_RUN_STEP,
+    PROCESSING_CTRL_CAL_C3_REP,
+    PROCESSING_CTRL_CAL_C4_CYCLE,
+} processing_control_cmd_t;
+
+typedef struct {
+    processing_control_cmd_t cmd;
+    char                     step;
+} processing_control_msg_t;
 
 /*
  * Initialise the processing module.
  * Call from app_main before spawning processing_task.
  *
- * raw_q        — the inter-core queue; Core 1 reads from it
- * uart_event_q — UART driver event queue for incoming commands
- * cal          — calibration parameters (pointer stored; must remain valid)
+ * raw_q — the inter-core queue; Core 1 reads from it
+ * cal   — calibration parameters (pointer stored; must remain valid)
  */
 void processing_init(QueueHandle_t raw_q,
-                     QueueHandle_t uart_event_q,
                      cal_params_t  *cal);
+
+/*
+ * Post a control-plane command from Core 0 into the Core 1 processing module.
+ * This keeps processing-owned state single-threaded even though UART ingress
+ * lives in the Core 0 control task.
+ */
+bool processing_submit_control(const processing_control_msg_t *msg,
+                               TickType_t                     timeout_ticks);
+
+/*
+ * Suppress or restore normal 20 Hz runtime JSON while multitasking proof mode
+ * is active. This flag is intentionally narrow and does not move the rest of
+ * processing state across cores.
+ */
+void processing_set_mt_mode(bool enabled);
 
 /*
  * Core 1 task entry point — pin with xTaskCreatePinnedToCore(..., 1).
