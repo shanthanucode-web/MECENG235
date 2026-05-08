@@ -107,6 +107,8 @@ def resolve_port(explicit_port: str | None) -> str:
     if explicit_port:
         return explicit_port
 
+    # Zero-argument launch is the default demo path; auto-detect first and
+    # only ask the user when several plausible ESP32 ports are present.
     candidates = list_candidate_ports()
     if not candidates:
         all_ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -154,6 +156,8 @@ def render_timeline(cycle: LatestCycle, period_us: float | None) -> str:
     if not period_us or period_us <= 0:
         period_us = 10_000.0
 
+    # This is a compressed sketch, not a to-scale trace. The authoritative
+    # proof is the textual event chain and the firmware-computed statistics.
     def raw_pos(delta_us: int) -> int:
         if delta_us <= 0:
             return 1
@@ -245,6 +249,8 @@ def reader_thread(port: str, baud: int) -> None:
             pkt = json.loads(text)
 
             with _lock:
+                # Firmware acks tell the dashboard when proof mode is truly
+                # active instead of assuming the command succeeded instantly.
                 if pkt.get("mt") == "ON":
                     _trace_enabled = True
                     _event_log.appendleft("mode enabled")
@@ -253,6 +259,9 @@ def reader_thread(port: str, baud: int) -> None:
                     _trace_enabled = False
                     _event_log.appendleft("mode disabled")
                     continue
+                # Snapshot packets are already aggregated on Core 1. The host
+                # should display them directly, not re-derive timing from
+                # packet arrival cadence.
                 if pkt.get("mt") != "SN":
                     continue
 

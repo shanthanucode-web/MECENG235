@@ -9,6 +9,9 @@ static const char *TAG     = "NVS";
 static const char *NVS_NS  = "trainer_cal";
 static const char *NVS_KEY = "cal_params";
 
+/* Calibration persistence is intentionally all-or-nothing: one blob in NVS
+ * represents the whole learned state. That keeps versioning simple and avoids
+ * partial-save edge cases in a teaching project. */
 esp_err_t nvs_load_calibration(cal_params_t *out)
 {
     nvs_handle_t h;
@@ -90,6 +93,8 @@ void nvs_get_defaults(cal_params_t *out)
 {
     memset(out, 0, sizeof(*out));
 
+    /* Defaults give the firmware a safe, usable starting point even before a
+     * real user has completed calibration. */
     /* FSR baseline: no contact, small noise floor */
     for (int i = 0; i < 3; i++) {
         out->mu[i]         = 0.0f;

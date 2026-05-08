@@ -12,9 +12,24 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Core 0 control plane
+ * --------------------
+ * This file owns low-priority project work on Core 0:
+ *   - UART0 command ingress
+ *   - command parsing / dispatch
+ *   - coordination with the Core 1 processing module
+ *   - multitasking-proof mode control
+ *
+ * Keeping this work separate from acquisition_task is what makes the
+ * multitasking story honest: there is a real project task on Core 0 that can
+ * be preempted by higher-priority timer/acquisition work.
+ */
+
 static QueueHandle_t   s_uart_q;
 static bool            s_mt_mode_enabled = false;
 
+/* Core 0 never mutates processing state directly; it posts intent messages. */
 static bool post_processing_cmd(processing_control_cmd_t cmd, char step)
 {
     processing_control_msg_t msg = {
@@ -40,6 +55,10 @@ static void dispatch_command(const char *cmd, int len)
 
     char response[64];
 
+    /*
+     * Proof-mode commands coordinate both halves of the proof path:
+     * Core 0 raw event capture and Core 1 snapshot emission.
+     */
     if (len >= 5 && strncmp(cmd, "MT_ON", 5) == 0) {
         acquisition_mt_trace_set_enabled(true);
         processing_set_mt_mode(true);
@@ -70,6 +89,10 @@ static void dispatch_command(const char *cmd, int len)
         return;
     }
 
+    /*
+     * Everything else is ordinary project control. The protocol is short on
+     * purpose so a GUI, a Python script, or a serial console can all drive it.
+     */
     switch (cmd[0]) {
     case 'I':
         led_status_solid_on();
@@ -111,6 +134,7 @@ static bool poll_uart_once(TickType_t timeout_ticks)
 {
     uart_event_t ev;
 
+    /* UART0 driver events are the asynchronous source behind host commands. */
     if (xQueueReceive(s_uart_q, &ev, timeout_ticks) != pdTRUE) {
         return false;
     }
@@ -118,6 +142,8 @@ static bool poll_uart_once(TickType_t timeout_ticks)
     if (ev.type == UART_DATA) {
         uint8_t cmd_buf[32];
         memset(cmd_buf, 0, sizeof(cmd_buf));
+        /* Commands are intentionally short and newline-free, so one bounded
+         * read is enough for the project protocol. */
         int n_read = uart_read_bytes(UART_NUM_0, cmd_buf,
                                      (ev.size < 31) ? (uint32_t)ev.size : 31U,
                                      0);
@@ -140,6 +166,9 @@ void control_task(void *arg)
 
     for (;;) {
         if (s_mt_mode_enabled) {
+            /* In proof mode this task stays runnable and yields voluntarily
+             * when idle, making it visible as the real low-priority task that
+             * acquisition_task preempts on Core 0. */
             acquisition_mt_trace_ctrl_enter();
 
             bool did_uart = poll_uart_once(0);
@@ -149,6 +178,8 @@ void control_task(void *arg)
             continue;
         }
 
+        /* Outside proof mode the task simply sleeps on UART events, which is
+         * exactly what low-priority control-plane work should do. */
         acquisition_mt_trace_ctrl_exit();
         poll_uart_once(portMAX_DELAY);
     }

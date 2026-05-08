@@ -11,6 +11,8 @@ static const char *TAG = "LED_STATUS";
 static esp_timer_handle_t s_led_timer;
 static volatile int s_led_level = 0;
 
+/* The LED uses esp_timer for the same reason the rest of the project does:
+ * blinking should never block a task just to wait on wall-clock time. */
 static void led_timer_cb(void *arg)
 {
     (void)arg;

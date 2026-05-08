@@ -2,6 +2,10 @@
 
 #include <stdint.h>
 
+/* This module provides the small DSP building blocks used by processing.c.
+ * Coefficients are fixed for the 100 Hz runtime, so callers only manage
+ * per-signal filter state. */
+
 /* ── Biquad state (Direct Form II Transposed) ───────────────────────────── */
 typedef struct {
     float w1;

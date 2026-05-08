@@ -4,6 +4,10 @@ IMU Test Script — BNO085 via CEVA sh2
 Reads live JSON telemetry from the ESP32 and displays
 gyroscope, accelerometer, and Euler angle data in real time.
 
+This validates the IMU portion of the firmware telemetry path. It does not
+talk to the IMU directly; it checks what the ESP32 is already decoding and
+publishing over JSON.
+
 Usage:
     python tests/imu_test.py                      # auto-detect port
     python tests/imu_test.py /dev/cu.usbserial-X  # explicit port
@@ -42,6 +46,7 @@ MAX_ACCEL  = 2.0     # g — full bar
 
 # ── Port detection (same logic as fsr_test.py) ─────────────────────────────
 def detect_port() -> str | None:
+    """Match the same USB-serial style devices used across repo tools."""
     ports = list(serial.tools.list_ports.comports())
     for p in ports:
         if any(k in p.device for k in ("usbserial", "usbmodem", "ttyUSB", "ttyACM")):

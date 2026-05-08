@@ -13,6 +13,9 @@
 # GPIO 4/A5 (Core 0 timer tick) and GPIO 12 (Core 1 processing) are the hardware heartbeats.
 # This script provides the software equivalent without an oscilloscope.
 #
+# Use this when you want an architecture/throughput view, not when you want
+# the stricter multitasking proof. That proof lives in multitask_proof.py.
+#
 # Read-only — does not send any commands to the ESP32.
 # Press Ctrl+C to exit.
 

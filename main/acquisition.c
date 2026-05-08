@@ -47,6 +47,9 @@ static volatile bool     s_mt_trace_enabled = false;
 static volatile uint32_t s_mt_trace_seq = 0;
 static volatile uint32_t s_mt_trace_dropped = 0;
 static volatile uint32_t s_mt_cycle_id = 0;
+/* These flags let the real Core 0 control task prove "I was running before
+ * the timer fired" and "I resumed after acquisition finished" without adding
+ * any synthetic demo workload. */
 static volatile bool     s_mt_ctrl_running = false;
 static volatile bool     s_mt_ctrl_resume_armed = false;
 static volatile uint32_t s_mt_resume_cycle_id = 0;
@@ -83,6 +86,8 @@ static void mt_trace_emit_ex(mt_trace_event_code_t code,
         .aux = aux,
     };
 
+    /* Trace events must never stall Core 0; if the queue is full we count the
+     * drop and keep the real-time path moving. */
     if (xQueueSend(s_mt_trace_q, &ev, 0) != pdTRUE) {
         __atomic_add_fetch(&s_mt_trace_dropped, 1u, __ATOMIC_RELAXED);
     }
@@ -132,6 +137,8 @@ static float fsr402_mv_to_newton(float v_mv)
 static void timer_isr_cb(void *arg)
 {
     (void)arg;
+    /* Each timer tick starts one proof cycle. Core 1 later reassembles these
+     * raw events by cycle_id instead of guessing from host packet timing. */
     uint32_t cycle_id = __atomic_add_fetch(&s_mt_cycle_id, 1u, __ATOMIC_RELAXED);
     bool ctrl_running = s_mt_ctrl_running;
     mt_trace_emit_ex(MT_TRACE_TIMER_CB_BEGIN, cycle_id, ctrl_running ? 1u : 0u);
@@ -396,6 +403,7 @@ void acquisition_task(void *arg)
 
 void acquisition_mt_trace_set_enabled(bool enabled)
 {
+    /* Resetting state on every enable/disable keeps proof runs independent. */
     s_mt_trace_enabled = false;
     s_mt_ctrl_running = false;
     s_mt_ctrl_resume_armed = false;
@@ -431,6 +439,8 @@ void acquisition_mt_trace_ctrl_enter(void)
 {
     s_mt_ctrl_running = true;
 
+    /* The next re-entry after acquisition completes emits CTRL_RESUME, which
+     * closes the same-core preemption chain shown on the dashboard. */
     if (s_mt_trace_enabled && s_mt_ctrl_resume_armed) {
         uint32_t cycle_id = __atomic_load_n(&s_mt_resume_cycle_id, __ATOMIC_RELAXED);
         s_mt_ctrl_resume_armed = false;

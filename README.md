@@ -12,6 +12,9 @@ This README is intentionally written as both:
 
 The project is implemented natively with ESP-IDF on the ESP32. It does not use Arduino.
 
+For a deeper developer-facing map of the repo, see
+[CODEBASE_WALKTHROUGH.md](/Users/shanthanu/uart_echo_VitalSignsLab4/CODEBASE_WALKTHROUGH.md).
+
 ---
 
 ## Table of Contents

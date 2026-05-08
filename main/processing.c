@@ -166,6 +166,8 @@ static void mt_trace_state_reset(void)
     memset(&s_mt_trace_state, 0, sizeof(s_mt_trace_state));
 }
 
+/* Active proof cycles are kept in a small ring because Core 1 is rebuilding
+ * them from raw events, not receiving one pre-packaged packet per cycle. */
 static mt_cycle_trace_t *mt_trace_find_cycle(uint32_t cycle_id, bool create)
 {
     mt_cycle_trace_t *free_slot = NULL;
@@ -216,6 +218,8 @@ static void mt_trace_complete_cycle(mt_cycle_trace_t *cycle)
         return;
     }
 
+    /* A complete cycle is both the latest dashboard example and one sample in
+     * the rolling timing statistics. */
     cycle->complete = true;
     s_mt_trace_state.latest = *cycle;
     s_mt_trace_state.have_latest = true;
@@ -237,6 +241,8 @@ static void mt_trace_collect_stats(double   *period_us_avg,
                                    double   *ctrl_ratio,
                                    uint32_t *sample_count)
 {
+    /* These statistics are computed from assembled firmware cycles, not from
+     * host-side packet arrival spacing. */
     double prev_tb = 0.0;
     double period_sum = 0.0;
     double period_sum_sq = 0.0;
@@ -301,6 +307,8 @@ static void mt_trace_emit_snapshot(void)
                            &acq_us, &ctrl_resume_us, &ctrl_ratio, &n);
 
     const mt_cycle_trace_t *c = &s_mt_trace_state.latest;
+    /* Snapshot packets run at 20 Hz so proof mode stays presentation-safe and
+     * does not perturb the Core 0 task we are trying to reason about. */
     int len = snprintf(buf, sizeof(buf),
                        "{\"mt\":\"SN\",\"latest\":{\"ctrl\":%" PRIu32 ",\"tb\":%" PRId64 ",\"sg\":%" PRId64
                        ",\"aw\":%" PRId64 ",\"ad\":%" PRId64 ",\"cr\":%" PRId64 "},"
@@ -326,6 +334,8 @@ static void mt_trace_drain_events(void)
 {
     mt_trace_event_t ev;
 
+    /* Core 1 owns the expensive proof work: drain raw events, rebuild cycles,
+     * compute stats, and serialize snapshots over UART0. */
     while (acquisition_mt_trace_pop(&ev)) {
         mt_cycle_trace_t *cycle = mt_trace_find_cycle(ev.cycle_id, ev.code == MT_TRACE_TIMER_CB_BEGIN);
         if (cycle == NULL) {
@@ -585,6 +595,8 @@ static void handle_control_msg(const processing_control_msg_t *msg)
         return;
     }
 
+    /* Core 0 decides that a command arrived; Core 1 decides what that means
+     * for scoring, calibration, and runtime state. */
     switch (msg->cmd) {
     case PROCESSING_CTRL_IDENTIFY:
         uart_write_bytes(UART_NUM_0, "ESP32_TRAINER\r\n", 15);
@@ -650,6 +662,8 @@ static void drain_control_queue(void)
 {
     processing_control_msg_t msg;
 
+    /* Drain-to-empty keeps command handling responsive without forcing the hot
+     * sample path to branch on one command at a time. */
     while (s_ctrl_q != NULL && xQueueReceive(s_ctrl_q, &msg, 0) == pdTRUE) {
         handle_control_msg(&msg);
     }
@@ -662,6 +676,8 @@ void processing_init(QueueHandle_t raw_q,
 {
     s_raw_q  = raw_q;
     s_cal    = cal;
+    /* This queue is the handoff from the Core 0 control plane to the Core 1
+     * owner of processing/calibration state. */
     s_ctrl_q = xQueueCreate(8, sizeof(processing_control_msg_t));
     configASSERT(s_ctrl_q != NULL);
 
@@ -708,6 +724,8 @@ bool processing_submit_control(const processing_control_msg_t *msg,
 
 void processing_set_mt_mode(bool enabled)
 {
+    /* Proof mode does not alter scoring logic; it only swaps normal runtime
+     * JSON for proof snapshots and clears stale trace state. */
     s_mt_mode_enabled = enabled;
     mt_trace_state_reset();
 }

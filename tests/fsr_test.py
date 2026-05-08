@@ -4,6 +4,9 @@ FSR Force Sensor Test Script
 Reads live JSON telemetry from the ESP32 and displays
 force readings for all three FSR 402 sensors in real time.
 
+This validates the force-sensor portion of the firmware telemetry path rather
+than the FSR hardware in isolation.
+
 Usage:
     python tests/fsr_test.py                      # auto-detect port
     python tests/fsr_test.py /dev/cu.usbserial-X  # explicit port
@@ -84,6 +87,7 @@ def bar(f: float, width: int = BAR_WIDTH) -> str:
 
 
 def detect_port() -> str | None:
+    """Pick the most likely ESP32 serial device without manual setup."""
     ports = list(serial.tools.list_ports.comports())
 
     # Priority 1: USB-serial adapters (CP210x / CH340 / FTDI) — the ESP32

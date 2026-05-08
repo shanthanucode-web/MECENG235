@@ -13,6 +13,8 @@ static const gpio_num_t MOTOR_PINS[4] = {
 
 #if MOTORS_ENABLED
 
+/* Motors are driven as short pulses rather than blocking delays. An esp_timer
+ * callback turns each output back off asynchronously. */
 static esp_timer_handle_t s_timers[4];
 
 static void motor_off_cb(void *arg)
@@ -53,6 +55,8 @@ void motor_pulse(uint8_t idx, uint32_t duration_ms)
 
 #else   /* MOTORS_ENABLED == 0 */
 
+/* The disabled build still initialises pins so the rest of the firmware can
+ * call motor_pulse() without sprinkling #ifdefs through scoring logic. */
 void motor_control_init(void)
 {
     for (int i = 0; i < 4; i++) {

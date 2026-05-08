@@ -254,6 +254,10 @@ static float window_rms_local(const float *values, int n)
     return sqrtf(sum / (float)n);
 }
 
+/* Calibration stage telemetry
+ * ---------------------------
+ * These helpers emit progress breadcrumbs so the GUI can explain what the
+ * firmware is currently waiting for during a blocking calibration stage. */
 static void emit_stage_event(const char *stage,
                              const char *phase,
                              float progress,
@@ -317,6 +321,9 @@ static esp_err_t run_c3_grip_hold(QueueHandle_t raw_q,
                                   const cal_params_t *params,
                                   float *mean_force_out)
 {
+    /* C3 captures a stable, intentional light grip. The stage only passes if
+     * force is present, motion stays quiet, and the grip is held long enough
+     * to trust its average value. */
     const char *stage = "grip_hold";
     float baseline_force = params->mu[0] + params->mu[1] + params->mu[2];
     float required_force = baseline_force + CAL_C3_GRIP_DELTA_MIN_N;
@@ -396,6 +403,8 @@ static esp_err_t run_c4_hand_motion(QueueHandle_t raw_q,
                                     float *motion_rms_out,
                                     float *motion_tremor_ratio_out)
 {
+    /* C4 captures what "normal hand motion" looks like for this user so the
+     * live scorer can compare tremor-like motion against a learned baseline. */
     const char *stage = "hand_motion";
     float *omega_window = s_cal_omega_window;
     float *roll_window = s_cal_roll_window;
@@ -1027,6 +1036,8 @@ static esp_err_t __attribute__((unused)) run_figure8_stage(QueueHandle_t raw_q,
 
 static esp_err_t cal_c1(QueueHandle_t raw_q, cal_params_t *params)
 {
+    /* C1 is the still-hand baseline: gyro bias, neutral pose, and no-motion
+     * tremor reference all come from this quiet capture window. */
     const int N = CAL_C1_SAMPLES;
     welford_t wf_omega, wf_roll, wf_pitch, wf_yaw, wf_tremor, wf_quat[4], wf_g[3];
     welford_reset(&wf_omega);
@@ -1122,6 +1133,8 @@ static esp_err_t cal_c1(QueueHandle_t raw_q, cal_params_t *params)
 
 static esp_err_t cal_c2(QueueHandle_t raw_q, cal_params_t *params)
 {
+    /* C2 is the no-pressure FSR baseline. It learns what each finger sensor
+     * looks like when the glove is worn but not intentionally gripping. */
     const int N = CAL_C2_SAMPLES;
     welford_t wf[3];
     float first_sum[3] = {0.0f, 0.0f, 0.0f};
@@ -1201,6 +1214,8 @@ static esp_err_t cal_c2(QueueHandle_t raw_q, cal_params_t *params)
 
 static esp_err_t cal_c3_grip(QueueHandle_t raw_q, cal_params_t *params)
 {
+    /* C3 stores the user's reference grip force. Later difficulty modes scale
+     * their thresholds from this learned open-grip force. */
     float grip_force = 0.0f;
     char buf[256];
 
@@ -1235,6 +1250,8 @@ static esp_err_t cal_c3_grip(QueueHandle_t raw_q, cal_params_t *params)
 
 static esp_err_t cal_c4_motion(QueueHandle_t raw_q, cal_params_t *params)
 {
+    /* C4 stores a reference for deliberate, non-tremor motion: broadband
+     * motion energy, tremor-band fraction, and orientation excursion ranges. */
     float f95_ref = 0.0f;
     float pp_roll_ref = 0.0f;
     float pp_pitch_ref = 0.0f;
@@ -1284,6 +1301,8 @@ esp_err_t calibration_run(char step, QueueHandle_t raw_q, cal_params_t *params)
 {
     ESP_LOGI(TAG, "Starting calibration step C%c", step);
 
+    /* Steps are intentionally independent so the host can re-run one stage
+     * without forcing the entire calibration sequence every time. */
     switch (step) {
     case '1':
         return cal_c1(raw_q, params);
