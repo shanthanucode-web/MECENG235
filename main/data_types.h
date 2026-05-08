@@ -110,39 +110,84 @@ typedef struct {
 /* Expert mean force: 0.9 N (Horeman et al. 2010)                           */
 /* Novice mean force: 2.1 N (Horeman et al. 2010)                           */
 /* Novice max force:  4.7 N (Horeman et al. 2010)                           */
-/* Warning at 2.0 N = above expert mean, below novice mean                  */
-/* Error   at 4.0 N = near novice maximum                                   */
-#define FORCE_WARN_SUM_N       2.0f  /* F_sum warning threshold (N) */
-#define FORCE_ERR_SUM_N        4.0f  /* F_sum error threshold   (N) */
-#define FORCE_WARN_FINGER_N    0.8f  /* per-finger warning (N)      */
-#define FORCE_ERR_FINGER_N     1.5f  /* per-finger error   (N)      */
+/* Warning at 2.2 N = above expert mean, near novice mean                   */
+/* Error   at 4.4 N = near novice maximum                                   */
+#define FORCE_WARN_SUM_N       2.2f  /* F_sum warning threshold (N) */
+#define FORCE_ERR_SUM_N        4.4f  /* F_sum error threshold   (N) */
+#define FORCE_WARN_FINGER_N    0.88f /* per-finger warning (N)      */
+#define FORCE_ERR_FINGER_N     1.65f /* per-finger error   (N)      */
 #define FORCE_SUSTAIN_SAMPLES  10    /* 100 ms sustain at 100 Hz    */
 
 /* Force mode multipliers applied to cal_params_t.f_ref_open */
-#define FORCE_EASY_WARN_X   2.5f
-#define FORCE_EASY_ERR_X    4.0f
-#define FORCE_MED_WARN_X    2.0f
-#define FORCE_MED_ERR_X     3.5f
-#define FORCE_HARD_WARN_X   1.5f
-#define FORCE_HARD_ERR_X    2.5f
+/*
+ * Easy should tolerate a noticeably heavier and less consistent beginner grip,
+ * medium should still be coachable without feeling punitive, and hard should
+ * remain the stricter training mode.
+ */
+#define FORCE_EASY_WARN_X   3.85f
+#define FORCE_EASY_ERR_X    6.05f
+#define FORCE_MED_WARN_X    3.03f
+#define FORCE_MED_ERR_X     4.95f
+#define FORCE_HARD_WARN_X   2.20f
+#define FORCE_HARD_ERR_X    3.52f
+
+#define FORCE_EASY_WARN_FINGER_N   1.32f
+#define FORCE_EASY_ERR_FINGER_N    2.42f
+#define FORCE_MED_WARN_FINGER_N    1.05f
+#define FORCE_MED_ERR_FINGER_N     1.93f
+#define FORCE_HARD_WARN_FINGER_N   0.83f
+#define FORCE_HARD_ERR_FINGER_N    1.49f
 
 /* Tremor thresholds:
  * - EXCESS_DPS is 6-12 Hz gyro RMS above the C1 no-motion baseline.
  * - RATIO is the fraction of total motion that sits in the tremor band.
  * A live tremor warning requires both amplitude and ratio to exceed threshold. */
-#define TREMOR_EASY_WARN_EXCESS_DPS   4.0f
-#define TREMOR_EASY_ERR_EXCESS_DPS    6.0f
-#define TREMOR_MED_WARN_EXCESS_DPS    3.0f
-#define TREMOR_MED_ERR_EXCESS_DPS     5.0f
-#define TREMOR_HARD_WARN_EXCESS_DPS   2.0f
-#define TREMOR_HARD_ERR_EXCESS_DPS    3.5f
+#define TREMOR_EASY_WARN_EXCESS_DPS   6.60f
+#define TREMOR_EASY_ERR_EXCESS_DPS    9.90f
+#define TREMOR_MED_WARN_EXCESS_DPS    4.95f
+#define TREMOR_MED_ERR_EXCESS_DPS     7.70f
+#define TREMOR_HARD_WARN_EXCESS_DPS   3.30f
+#define TREMOR_HARD_ERR_EXCESS_DPS    5.50f
 
-#define TREMOR_EASY_WARN_RATIO   0.50f
-#define TREMOR_EASY_ERR_RATIO    0.70f
-#define TREMOR_MED_WARN_RATIO    0.40f
-#define TREMOR_MED_ERR_RATIO     0.60f
-#define TREMOR_HARD_WARN_RATIO   0.30f
-#define TREMOR_HARD_ERR_RATIO    0.50f
+#define TREMOR_EASY_WARN_RATIO   0.77f
+#define TREMOR_EASY_ERR_RATIO    0.99f
+#define TREMOR_MED_WARN_RATIO    0.61f
+#define TREMOR_MED_ERR_RATIO     0.83f
+#define TREMOR_HARD_WARN_RATIO   0.44f
+#define TREMOR_HARD_ERR_RATIO    0.66f
+
+#define HOLD_EASY_WARN_OMEGA_DPS   8.25f
+#define HOLD_EASY_ERR_OMEGA_DPS   12.10f
+#define HOLD_MED_WARN_OMEGA_DPS    6.60f
+#define HOLD_MED_ERR_OMEGA_DPS     9.90f
+#define HOLD_HARD_WARN_OMEGA_DPS   4.95f
+#define HOLD_HARD_ERR_OMEGA_DPS    7.70f
+
+#define HOLD_EASY_WARN_SD_DEG   3.30f
+#define HOLD_EASY_ERR_SD_DEG    4.40f
+#define HOLD_MED_WARN_SD_DEG    2.75f
+#define HOLD_MED_ERR_SD_DEG     3.74f
+#define HOLD_HARD_WARN_SD_DEG   1.98f
+#define HOLD_HARD_ERR_SD_DEG    2.97f
+
+#define FORCE_VAR_EASY_SD_N   0.77f
+#define FORCE_VAR_MED_SD_N    0.61f
+#define FORCE_VAR_HARD_SD_N   0.44f
+
+#define FORCE_VAR_EASY_CV     0.44f
+#define FORCE_VAR_MED_CV      0.33f
+#define FORCE_VAR_HARD_CV     0.24f
+
+#define FORCE_SPIKE_EASY_DFDT_NPS   38.5f
+#define FORCE_SPIKE_MED_DFDT_NPS    27.5f
+#define FORCE_SPIKE_HARD_DFDT_NPS   19.8f
+
+#define SCORE_EASY_WARN_PENALTY   0.045f
+#define SCORE_EASY_ERR_PENALTY    0.135f
+#define SCORE_MED_WARN_PENALTY    0.090f
+#define SCORE_MED_ERR_PENALTY     0.225f
+#define SCORE_HARD_WARN_PENALTY   0.180f
+#define SCORE_HARD_ERR_PENALTY    0.450f
 
 #define TREMOR_BASELINE_FLOOR_DPS  3.0f
 #define TREMOR_RATIO_FLOOR_DPS     1.0f

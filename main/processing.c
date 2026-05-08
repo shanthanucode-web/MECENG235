@@ -87,10 +87,21 @@ static float s_actual_hz = 100.0f;
 /* ── Active force thresholds (updated by E/M/H commands) ─────────────── */
 static float s_warn_sum_n = FORCE_WARN_SUM_N;  /* 2.0 N default (medium) */
 static float s_err_sum_n  = FORCE_ERR_SUM_N;   /* 4.0 N default (medium) */
+static float s_warn_finger_n = FORCE_MED_WARN_FINGER_N;
+static float s_err_finger_n  = FORCE_MED_ERR_FINGER_N;
 static float s_warn_tremor_excess_dps = TREMOR_MED_WARN_EXCESS_DPS;
 static float s_err_tremor_excess_dps  = TREMOR_MED_ERR_EXCESS_DPS;
 static float s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
 static float s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
+static float s_warn_hold_omega_dps = HOLD_MED_WARN_OMEGA_DPS;
+static float s_err_hold_omega_dps  = HOLD_MED_ERR_OMEGA_DPS;
+static float s_warn_hold_sd_deg    = HOLD_MED_WARN_SD_DEG;
+static float s_err_hold_sd_deg     = HOLD_MED_ERR_SD_DEG;
+static float s_warn_force_var_sd_n = FORCE_VAR_MED_SD_N;
+static float s_warn_force_var_cv   = FORCE_VAR_MED_CV;
+static float s_warn_force_spike_nps = FORCE_SPIKE_MED_DFDT_NPS;
+static float s_warn_score_penalty = SCORE_MED_WARN_PENALTY;
+static float s_err_score_penalty  = SCORE_MED_ERR_PENALTY;
 
 /* ── Sustained error counters for force compression ──────────────────── */
 static int s_warn_force_dur_cnt = 0;
@@ -575,18 +586,40 @@ static void update_contact(int i, float fsr_filtered)
 
 static void apply_difficulty(float warn_force_scale,
                              float err_force_scale,
+                             float warn_finger_n,
+                             float err_finger_n,
                              float warn_tremor_excess_dps,
                              float err_tremor_excess_dps,
                              float warn_tremor_ratio,
-                             float err_tremor_ratio)
+                             float err_tremor_ratio,
+                             float warn_hold_omega_dps,
+                             float err_hold_omega_dps,
+                             float warn_hold_sd_deg,
+                             float err_hold_sd_deg,
+                             float warn_force_var_sd_n,
+                             float warn_force_var_cv,
+                             float warn_force_spike_nps,
+                             float warn_score_penalty,
+                             float err_score_penalty)
 {
     reset_session_metrics();
     s_warn_sum_n = s_cal->f_ref_open * warn_force_scale;
     s_err_sum_n  = s_cal->f_ref_open * err_force_scale;
+    s_warn_finger_n = warn_finger_n;
+    s_err_finger_n  = err_finger_n;
     s_warn_tremor_excess_dps = warn_tremor_excess_dps;
     s_err_tremor_excess_dps  = err_tremor_excess_dps;
     s_warn_tremor_ratio = warn_tremor_ratio;
     s_err_tremor_ratio  = err_tremor_ratio;
+    s_warn_hold_omega_dps = warn_hold_omega_dps;
+    s_err_hold_omega_dps  = err_hold_omega_dps;
+    s_warn_hold_sd_deg    = warn_hold_sd_deg;
+    s_err_hold_sd_deg     = err_hold_sd_deg;
+    s_warn_force_var_sd_n = warn_force_var_sd_n;
+    s_warn_force_var_cv   = warn_force_var_cv;
+    s_warn_force_spike_nps = warn_force_spike_nps;
+    s_warn_score_penalty = warn_score_penalty;
+    s_err_score_penalty  = err_score_penalty;
 }
 
 static void handle_control_msg(const processing_control_msg_t *msg)
@@ -610,28 +643,61 @@ static void handle_control_msg(const processing_control_msg_t *msg)
     case PROCESSING_CTRL_SET_EASY:
         apply_difficulty(FORCE_EASY_WARN_X,
                          FORCE_EASY_ERR_X,
+                         FORCE_EASY_WARN_FINGER_N,
+                         FORCE_EASY_ERR_FINGER_N,
                          TREMOR_EASY_WARN_EXCESS_DPS,
                          TREMOR_EASY_ERR_EXCESS_DPS,
                          TREMOR_EASY_WARN_RATIO,
-                         TREMOR_EASY_ERR_RATIO);
+                         TREMOR_EASY_ERR_RATIO,
+                         HOLD_EASY_WARN_OMEGA_DPS,
+                         HOLD_EASY_ERR_OMEGA_DPS,
+                         HOLD_EASY_WARN_SD_DEG,
+                         HOLD_EASY_ERR_SD_DEG,
+                         FORCE_VAR_EASY_SD_N,
+                         FORCE_VAR_EASY_CV,
+                         FORCE_SPIKE_EASY_DFDT_NPS,
+                         SCORE_EASY_WARN_PENALTY,
+                         SCORE_EASY_ERR_PENALTY);
         uart_write_bytes(UART_NUM_0, "EASY\r\n", 6);
         break;
     case PROCESSING_CTRL_SET_MEDIUM:
         apply_difficulty(FORCE_MED_WARN_X,
                          FORCE_MED_ERR_X,
+                         FORCE_MED_WARN_FINGER_N,
+                         FORCE_MED_ERR_FINGER_N,
                          TREMOR_MED_WARN_EXCESS_DPS,
                          TREMOR_MED_ERR_EXCESS_DPS,
                          TREMOR_MED_WARN_RATIO,
-                         TREMOR_MED_ERR_RATIO);
+                         TREMOR_MED_ERR_RATIO,
+                         HOLD_MED_WARN_OMEGA_DPS,
+                         HOLD_MED_ERR_OMEGA_DPS,
+                         HOLD_MED_WARN_SD_DEG,
+                         HOLD_MED_ERR_SD_DEG,
+                         FORCE_VAR_MED_SD_N,
+                         FORCE_VAR_MED_CV,
+                         FORCE_SPIKE_MED_DFDT_NPS,
+                         SCORE_MED_WARN_PENALTY,
+                         SCORE_MED_ERR_PENALTY);
         uart_write_bytes(UART_NUM_0, "INTERMEDIATE\r\n", 14);
         break;
     case PROCESSING_CTRL_SET_HARD:
         apply_difficulty(FORCE_HARD_WARN_X,
                          FORCE_HARD_ERR_X,
+                         FORCE_HARD_WARN_FINGER_N,
+                         FORCE_HARD_ERR_FINGER_N,
                          TREMOR_HARD_WARN_EXCESS_DPS,
                          TREMOR_HARD_ERR_EXCESS_DPS,
                          TREMOR_HARD_WARN_RATIO,
-                         TREMOR_HARD_ERR_RATIO);
+                         TREMOR_HARD_ERR_RATIO,
+                         HOLD_HARD_WARN_OMEGA_DPS,
+                         HOLD_HARD_ERR_OMEGA_DPS,
+                         HOLD_HARD_WARN_SD_DEG,
+                         HOLD_HARD_ERR_SD_DEG,
+                         FORCE_VAR_HARD_SD_N,
+                         FORCE_VAR_HARD_CV,
+                         FORCE_SPIKE_HARD_DFDT_NPS,
+                         SCORE_HARD_WARN_PENALTY,
+                         SCORE_HARD_ERR_PENALTY);
         uart_write_bytes(UART_NUM_0, "HARD\r\n", 6);
         break;
     case PROCESSING_CTRL_EXIT:
@@ -706,10 +772,21 @@ void processing_init(QueueHandle_t raw_q,
     /* Initialise force thresholds to medium (default) mode */
     s_warn_sum_n = FORCE_WARN_SUM_N;
     s_err_sum_n  = FORCE_ERR_SUM_N;
+    s_warn_finger_n = FORCE_MED_WARN_FINGER_N;
+    s_err_finger_n  = FORCE_MED_ERR_FINGER_N;
     s_warn_tremor_excess_dps = TREMOR_MED_WARN_EXCESS_DPS;
     s_err_tremor_excess_dps  = TREMOR_MED_ERR_EXCESS_DPS;
     s_warn_tremor_ratio = TREMOR_MED_WARN_RATIO;
     s_err_tremor_ratio  = TREMOR_MED_ERR_RATIO;
+    s_warn_hold_omega_dps = HOLD_MED_WARN_OMEGA_DPS;
+    s_err_hold_omega_dps  = HOLD_MED_ERR_OMEGA_DPS;
+    s_warn_hold_sd_deg    = HOLD_MED_WARN_SD_DEG;
+    s_err_hold_sd_deg     = HOLD_MED_ERR_SD_DEG;
+    s_warn_force_var_sd_n = FORCE_VAR_MED_SD_N;
+    s_warn_force_var_cv   = FORCE_VAR_MED_CV;
+    s_warn_force_spike_nps = FORCE_SPIKE_MED_DFDT_NPS;
+    s_warn_score_penalty = SCORE_MED_WARN_PENALTY;
+    s_err_score_penalty  = SCORE_MED_ERR_PENALTY;
 
 }
 
@@ -941,16 +1018,16 @@ void processing_task(void *arg)
             float sd_max        = (sd_roll > sd_pitch) ? sd_roll : sd_pitch;
 
             /* Hold instability */
-            if (omega_rms_250 > 5.0f || sd_max > 2.0f) {
+            if (omega_rms_250 > s_warn_hold_omega_dps || sd_max > s_warn_hold_sd_deg) {
                 warn_flags |= WARN_HOLD_INSTABILITY;
             }
-            if (omega_rms_250 > 8.0f || sd_max > 3.0f) {
+            if (omega_rms_250 > s_err_hold_omega_dps || sd_max > s_err_hold_sd_deg) {
                 err_flags |= ERR_HOLD_INSTABILITY;
             }
 
             /* Hold force variability */
             float sd_fsig = window_stddev(s_fsig_win, wn);
-            if (sd_fsig > 0.4f || cv_f > 0.25f) {
+            if (sd_fsig > s_warn_force_var_sd_n || cv_f > s_warn_force_var_cv) {
                 warn_flags |= WARN_FORCE_VARIABILITY;
             }
         }
@@ -971,10 +1048,10 @@ void processing_task(void *arg)
         if (any_contact) {
             /* Per-finger thresholds (Horeman et al. 2010) */
             for (int fi = 0; fi < 3; fi++) {
-                if (fsr_f[fi] > FORCE_ERR_FINGER_N) {
+                if (fsr_f[fi] > s_err_finger_n) {
                     warn_flags |= WARN_FORCE_OPEN;
                     err_flags  |= ERR_FORCE_OPEN;
-                } else if (fsr_f[fi] > FORCE_WARN_FINGER_N) {
+                } else if (fsr_f[fi] > s_warn_finger_n) {
                     warn_flags |= WARN_FORCE_OPEN;
                 }
             }
@@ -998,7 +1075,7 @@ void processing_task(void *arg)
             }
 
             /* Force spike: |dF/dt| > 20 N/s */
-            if (fabsf(df_dt) > 20.0f) {
+            if (fabsf(df_dt) > s_warn_force_spike_nps) {
                 warn_flags |= WARN_FORCE_SPIKE;
             }
         }
@@ -1010,8 +1087,8 @@ void processing_task(void *arg)
         if (warn_flags & WARN_TREMOR)            motor_pulse(3, 200);
 
         /* ── 9. Running score ──────────────────────────────────────── */
-        if (warn_flags) s_score = (s_score > 0.2f) ? s_score - 0.2f : 0.0f;
-        if (err_flags)  s_score = (s_score > 0.5f) ? s_score - 0.5f : 0.0f;
+        if (warn_flags) s_score = (s_score > s_warn_score_penalty) ? s_score - s_warn_score_penalty : 0.0f;
+        if (err_flags)  s_score = (s_score > s_err_score_penalty) ? s_score - s_err_score_penalty : 0.0f;
 
         drain_control_queue();
         if (s_mt_mode_enabled) {

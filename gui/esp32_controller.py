@@ -7,6 +7,15 @@ motion, coaching, calibration, and optional 3D orientation/contact views.
 
 REDESIGN: _build_ui() and STYLESHEET updated for three-zone layout.
 All data classes, workers, signal/slot connections, and serial logic unchanged.
+
+How to read this file:
+1. Start with TelemetryStore — it explains how live packets are cached.
+2. Read SerialWorker — it owns the background UART thread.
+3. Read MainWindow.__init__ and _build_ui — they show the top-level GUI shape.
+4. Read _on_data_received, _handle_telemetry, and _handle_text_response —
+   that is the main host-side control/data flow.
+5. Read the calibration and summary dialogs last; they are consumers of the
+   same runtime state, not the source of it.
 """
 
 from __future__ import annotations
@@ -55,7 +64,9 @@ BAUD_RATE = 115200
 HISTORY_POINTS = 900
 PLOT_WINDOW_S = 30.0
 MAX_FEED_CARDS = 18
-
+HUD_RECOVERY_DELAY_S = 1.4
+HUD_CALM_STREAK_S = 0.45
+HUD_SAME_LEVEL_SWAP_S = 0.85
 # ── Color palette (unchanged) ────────────────────────────────────────────────
 
 NAVY      = "#0f2d52"
@@ -68,14 +79,14 @@ PANEL_ALT = "#f0f7ff"
 BORDER    = "#cfe1f5"
 GRID      = "#d9e9f8"
 TEXT      = "#10263f"
-MUTED     = "#63758a"
+MUTED     = "#b7b7b7"
 GREEN     = "#1f9d55"
 AMBER     = "#d98a00"
 RED       = "#c62828"
 VIOLET    = "#6f5bd6"
 GRAY      = "#9aaec3"
 
-WARN_LABELS = {
+WARN_TECH_LABELS = {
     1 << 0: "Hold instability",
     1 << 1: "Tremor",
     1 << 2: "Smoothness",
@@ -85,11 +96,28 @@ WARN_LABELS = {
     1 << 6: "Force spike",
 }
 
-ERR_LABELS = {
+ERR_TECH_LABELS = {
     1 << 0: "Hold instability",
     1 << 1: "Tremor",
     1 << 2: "Force opening",
     1 << 3: "Sustained compression",
+}
+
+WARN_COACH_LABELS = {
+    1 << 0: "Hold steady",
+    1 << 1: "Steady hand",
+    1 << 2: "Move more smoothly",
+    1 << 3: "Slow the motion",
+    1 << 4: "Ease grip",
+    1 << 5: "Keep pressure steady",
+    1 << 6: "Avoid sudden force",
+}
+
+ERR_COACH_LABELS = {
+    1 << 0: "Hold steady",
+    1 << 1: "Steady hand",
+    1 << 2: "Ease grip",
+    1 << 3: "Release pressure",
 }
 
 CALIBRATION_STEPS = {
@@ -128,7 +156,7 @@ CALIBRATION_STEPS = {
         "nav": "Hand Motion",
         "title": "Normal Hand Motion",
         "purpose": "Captures the way you naturally move your hand so the trainer can separate intended motion from actual tremor.",
-        "instruction": "Keep a light grip and move your hand naturally for a few seconds when prompted.",
+        "instruction": "Keep a light grip and move your hand naturally for 10 seconds when prompted.",
         "running": "Capturing normal hand motion",
         "success": "Normal hand motion saved.",
         "failure": "The glove could not capture enough clean normal hand motion. Move naturally and run the step again.",
@@ -152,7 +180,7 @@ CALIBRATION_STAGE_UI = {
     },
     "hand_motion": {
         "title": "Move hand naturally",
-        "instruction": "Keep a light grip and move your hand naturally for a few seconds so the glove can learn what intended motion looks like for you.",
+        "instruction": "Keep a light grip and move your hand naturally for 10 seconds so the glove can learn what intended motion looks like for you.",
     },
 }
 
@@ -234,6 +262,18 @@ COMMAND_BY_MODE = {mode: cmd for cmd, mode in MODE_BY_COMMAND.items()}
 
 @dataclass
 class TelemetryStore:
+    """
+    Rolling telemetry cache for plots and end-of-session summaries.
+
+    The firmware already sends structured JSON; this class does two GUI-side
+    jobs:
+    - keep a bounded history window for live plotting
+    - remember enough recent samples to build a session summary when the user
+      stops a run
+
+    The store keeps time as "seconds since session start" so the plots can use
+    a stable x-axis even if ESP32 timestamps continue increasing across runs.
+    """
     maxlen: int = HISTORY_POINTS
     packet_count: int = 0
     start_ms: float | None = None
@@ -257,6 +297,7 @@ class TelemetryStore:
             values.clear()
 
     def append(self, packet: dict) -> None:
+        # Convert absolute firmware time into a per-session relative timeline.
         t_ms = float(packet.get("t", 0.0))
         if self.start_ms is None:
             self.start_ms = t_ms
@@ -268,6 +309,8 @@ class TelemetryStore:
         for key in self.series:
             if key == "t":
                 continue
+            # Some plot channels are derived on the host for convenience rather
+            # than sent explicitly by the firmware.
             if key == "contact_any":
                 contact = packet.get("contact", [0, 0, 0])
                 if isinstance(contact, list) and len(contact) >= 3:
@@ -291,6 +334,19 @@ class TelemetryStore:
 # ── Serial worker (unchanged) ────────────────────────────────────────────────
 
 class SerialWorker(QThread):
+    """
+    Background serial thread.
+
+    Qt widgets must stay on the main thread, so UART I/O lives here instead.
+    The worker only does transport work:
+    - drain the outbound command queue
+    - read bytes from the ESP32
+    - split them into lines
+    - emit each line back to the GUI thread
+
+    Higher-level meaning (telemetry vs status vs command response) is handled
+    by MainWindow after the line crosses the thread boundary.
+    """
     data_received = Signal(str)
     error_occurred = Signal(str)
 
@@ -309,10 +365,14 @@ class SerialWorker(QThread):
             return
 
         self._running = True
+        # We read arbitrary byte chunks, not guaranteed full lines, so keep a
+        # small reassembly buffer until '\n' arrives.
         rx_buf = bytearray()
         partial_since: float | None = None
         try:
             while self._running:
+                # Outbound commands are queued by button clicks / dialogs in the
+                # GUI thread and written here so the UI never blocks on serial.
                 while not self._cmd_queue.empty():
                     try:
                         ser.write(self._cmd_queue.get_nowait())
@@ -329,6 +389,9 @@ class SerialWorker(QThread):
                             self.data_received.emit(line)
                     continue
 
+                # If the ESP32 stops mid-line, surface the fragment instead of
+                # silently discarding it. This is useful when debugging resets
+                # or malformed output.
                 if rx_buf and partial_since is not None and (time.monotonic() - partial_since) > 0.25:
                     fragment = rx_buf.decode("ascii", errors="replace").strip(" \t\r\n\0")
                     if fragment:
@@ -469,44 +532,30 @@ class VitalSignWidget(QFrame):
         self._active = False
         self._phase  = 0.0
         self._color  = MUTED
-        self._status = "Session idle"
-        self._detail = "Select a mode and press Start"
         self._timer  = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
-    def set_status(self, active: bool, warn: int = 0, err: int = 0) -> None:
+    def set_status(
+        self,
+        active: bool,
+        status: str = "",
+        detail: str = "",
+        color: str = MUTED,
+        pulse: bool = False,
+    ) -> None:
         self._active = active
-        if not active:
-            self._color  = MUTED
-            self._status = "Session idle"
-            self._detail = "Vital sign starts with live scoring"
-            self._timer.stop()
-            self._phase  = 0.0
-        elif err:
-            self._color  = RED
-            self._status = "Danger threshold"
-            self._detail = "Error flag active"
-            if not self._timer.isActive():
-                self._timer.start(70)
-        elif warn:
-            self._color  = AMBER
-            self._status = "Warning threshold"
-            self._detail = "Technique nearing limit"
+        self._color = color
+        if pulse:
             if not self._timer.isActive():
                 self._timer.start(70)
         else:
-            self._color  = GREEN
-            self._status = "Stable technique"
-            self._detail = "No active thresholds"
-            if not self._timer.isActive():
-                self._timer.start(70)
+            self._timer.stop()
+            self._phase = 0.0
         self.update()
 
     def set_countdown(self, text: str) -> None:
         self._active = False
         self._color  = BLUE
-        self._status = f"Starting in {text}" if text != "Begin" else "Begin"
-        self._detail = "Get ready"
         self._timer.stop()
         self._phase  = 0.0
         self.update()
@@ -524,23 +573,9 @@ class VitalSignWidget(QFrame):
         painter.setPen(Qt.NoPen)
         painter.setBrush(Qt.NoBrush)
 
-        painter.setPen(QColor(MUTED))
-        small = QFont(self.font())
-        small.setPointSize(8)
-        small.setBold(True)
-        painter.setFont(small)
-        painter.drawText(QPointF(8, 14), "LIVE VITAL")
-
-        painter.setPen(QColor(self._color))
-        title_font = QFont(self.font())
-        title_font.setPointSize(11)
-        title_font.setBold(True)
-        painter.setFont(title_font)
-        painter.drawText(QPointF(8, 32), self._status)
-
         left  = 8.0
         right = max(left + 24.0, rect.right() - 4.0)
-        base  = rect.center().y() + 12.0
+        base  = rect.center().y()
         amp   = 14.0 if self._active else 3.0
         path  = QPainterPath()
         for i in range(96):
@@ -562,6 +597,52 @@ class VitalSignWidget(QFrame):
 
         painter.setPen(QPen(QColor(self._color), 2.2))
         painter.drawPath(path)
+
+
+class AppIconWidget(QFrame):
+    """Small vector-style scissors mark drawn for crisp rendering at 36x36."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("app_icon")
+        self.setFixedSize(36, 36)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        pen = QPen(QColor(NAVY), 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+
+        # Finger rings
+        painter.drawEllipse(QRectF(8.0, 23.0, 8.5, 8.5))
+        painter.drawEllipse(QRectF(19.5, 23.0, 8.5, 8.5))
+
+        # Shanks converging into the hinge
+        painter.drawLine(QPointF(16.1, 25.0), QPointF(17.8, 18.2))
+        painter.drawLine(QPointF(20.0, 25.0), QPointF(18.3, 18.2))
+
+        # Hinge
+        painter.setBrush(QColor(NAVY))
+        painter.drawEllipse(QRectF(17.0, 16.7, 2.2, 2.2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Blade body: one straight edge, one gently curved edge
+        left_blade = QPainterPath(QPointF(17.7, 18.0))
+        left_blade.lineTo(16.9, 6.7)
+        left_blade.lineTo(18.4, 4.6)
+        left_blade.lineTo(18.5, 18.0)
+        painter.drawPath(left_blade)
+
+        right_blade = QPainterPath(QPointF(18.4, 18.0))
+        right_blade.cubicTo(QPointF(20.6, 14.8), QPointF(22.0, 10.2), QPointF(21.9, 5.0))
+        painter.drawPath(right_blade)
+
+        # Open tip
+        painter.drawLine(QPointF(16.8, 6.7), QPointF(15.7, 5.0))
+        painter.drawLine(QPointF(18.4, 4.7), QPointF(20.1, 3.2))
 
 
 # ── Calibration UI ───────────────────────────────────────────────────────────
@@ -927,7 +1008,7 @@ class CalibrationWizard(QDialog):
                 detail = "Keep a steady light grip until the glove captures your typical force."
             else:
                 base = "Move your hand naturally"
-                detail = "Keep a light grip and move your hand naturally for a few seconds so the glove can record intended motion."
+                detail = "Keep a light grip and move your hand naturally for 10 seconds so the glove can record intended motion."
             self._set_status(
                 "running",
                 base,
@@ -1223,7 +1304,13 @@ class SessionSummaryDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        # ── State (unchanged) ────────────────────────────────────────────────
+        # Runtime state for the host application.
+        #
+        # Keep the mental model simple:
+        # - SerialWorker owns the transport thread.
+        # - _cmd_queue is the only outbound path to the board.
+        # - _telemetry is the rolling cache for plots and summaries.
+        # - everything else is UI/session state derived from firmware output.
         self._worker: SerialWorker | None = None
         self._cmd_queue: queue.Queue = queue.Queue()
         self._connected = False
@@ -1244,6 +1331,13 @@ class MainWindow(QMainWindow):
         self._pending_live_mode: str | None = None
         self._countdown_value = 0
         self._last_score: float | None = None
+        self._hud_level = "idle"
+        self._hud_headline = ""
+        self._hud_detail = ""
+        self._hud_color = MUTED
+        self._hud_hold_until = 0.0
+        self._hud_calm_since: float | None = None
+        self._hud_last_change_at = 0.0
         self._telemetry   = TelemetryStore()
         self._curves: dict[str, pg.PlotDataItem] = {}
         self._plot_widgets: list[pg.PlotWidget] = []
@@ -1276,7 +1370,7 @@ class MainWindow(QMainWindow):
         self._set_commands_enabled(False)
         self._set_state(TrainerState.DISCONNECTED)
         self._set_mode("UNSELECTED")
-        self._vital_sign.set_status(False)
+        self._refresh_non_session_banner()
         self._update_start_button()
         self._add_activity("System ready. Connect glove to begin.", BLUE)
 
@@ -1291,7 +1385,7 @@ class MainWindow(QMainWindow):
     # ── NEW: Three-zone build entry point ─────────────────────────────────────
 
     def _build_ui(self, root: QVBoxLayout) -> None:
-        """Replace the original flat layout with the three-zone design."""
+        """Build the window in layers: app bar, main content, engineering log."""
         self._build_app_bar(root)       # Zone 1 — fixed 64 px top bar
         self._build_content_area(root)  # Zone 2 — expands to fill remaining height
         self._build_engineering_log(root)  # collapsible; stays outside the split
@@ -1316,14 +1410,14 @@ class MainWindow(QMainWindow):
 
         # Brand: icon + title + subtitle
         brand_row = QHBoxLayout()
-        brand_row.setSpacing(10)
+        brand_row.setSpacing(8)
 
-        icon_box = QFrame()
-        icon_box.setObjectName("app_icon")
-        icon_box.setFixedSize(36, 36)
+        icon_box = AppIconWidget()
+        brand_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         brand_text = QVBoxLayout()
-        brand_text.setSpacing(1)
+        brand_text.setSpacing(0)
+        brand_text.setContentsMargins(0, 1, 0, 0)
         title = QLabel("Haptic Surgical Skill Trainer")
         title.setObjectName("app_title")
         subtitle = QLabel("Clinical Training Console")
@@ -1339,7 +1433,7 @@ class MainWindow(QMainWindow):
         center_row = QHBoxLayout()
         center_row.setSpacing(8)
 
-        self._status_pill = QLabel("⬤  DISCONNECTED")
+        self._status_pill = QLabel("⬤  Disconnected")
         self._status_pill.setObjectName("status_pill")
         # DESIGN: status_pill uses border-radius:14px and dynamic background set
         # from Python so connected=green vs disconnected=gray reads in <1 second.
@@ -1376,7 +1470,7 @@ class MainWindow(QMainWindow):
         root.addWidget(bar)
 
     def _set_status_pill_disconnected(self) -> None:
-        self._status_pill.setText("⬤  DISCONNECTED")
+        self._status_pill.setText("⬤  Disconnected")
         self._status_pill.setStyleSheet(
             f"color: {MUTED}; background: #f4f7fa;"
             f"border: 1.5px solid {BORDER};"
@@ -1385,7 +1479,7 @@ class MainWindow(QMainWindow):
         )
 
     def _set_status_pill_connected(self) -> None:
-        self._status_pill.setText("⬤  CONNECTED")
+        self._status_pill.setText("⬤  Connected")
         self._status_pill.setStyleSheet(
             f"color: {GREEN}; background: #edf8f2;"
             f"border: 1.5px solid {GREEN};"
@@ -1503,12 +1597,12 @@ class MainWindow(QMainWindow):
         left = QVBoxLayout()
         left.setSpacing(4)
 
-        self._state_label = QLabel("DISCONNECTED")
+        self._state_label = QLabel("Connect glove")
         self._state_label.setObjectName("state_label")
 
         meta_row = QHBoxLayout()
         meta_row.setSpacing(8)
-        self._mode_label = QLabel("No mode selected")
+        self._mode_label = QLabel("No difficulty selected")
         self._mode_label.setObjectName("mode_badge")
         self._score_inline = QLabel("Score: --")
         self._score_inline.setObjectName("score_inline")
@@ -1537,17 +1631,9 @@ class MainWindow(QMainWindow):
         left.addLayout(meta_row)
         left.addLayout(status_row)
 
-        # Right: vital sign waveform
-        vital_col = QVBoxLayout()
-        vital_col.setSpacing(2)
-        vital_hdr = QLabel("LIVE VITAL")
-        vital_hdr.setObjectName("vital_header")
-        self._vital_sign = VitalSignWidget()
-        vital_col.addWidget(vital_hdr)
-        vital_col.addWidget(self._vital_sign)
-
         row.addLayout(left, 1)
-        row.addLayout(vital_col)
+        self._vital_sign = VitalSignWidget()
+        row.addWidget(self._vital_sign)
         root.addWidget(banner)
 
         # Helper refs for coaching / alerts (used by unchanged _update_coaching)
@@ -1939,7 +2025,7 @@ class MainWindow(QMainWindow):
         self._cmd_button_by_cmd["S"] = stop_btn
         self._sidebar_layout.addWidget(stop_btn)
 
-        self._countdown_label = QLabel("Select a mode, then press Start.")
+        self._countdown_label = QLabel("Pick a difficulty, then press Start.")
         self._countdown_label.setObjectName("countdown_label")
         self._countdown_label.setWordWrap(True)
         self._sidebar_layout.addSpacing(6)
@@ -1996,10 +2082,6 @@ class MainWindow(QMainWindow):
         exit_layout = QVBoxLayout(exit_strip)
         exit_layout.setContentsMargins(14, 10, 14, 14)
         exit_layout.setSpacing(6)
-
-        danger_header = QLabel("DANGER ZONE")
-        danger_header.setObjectName("section_header")
-        exit_layout.addWidget(danger_header)
 
         exit_btn = QPushButton("Exit Session")
         exit_btn.setObjectName("danger_button")
@@ -2069,12 +2151,12 @@ class MainWindow(QMainWindow):
             return
         mode = MODE_BY_COMMAND[cmd]
         if self._countdown_timer.isActive():
-            self._cancel_countdown("Countdown cancelled. Select a mode and press Start.")
+            self._cancel_countdown("Countdown cancelled. Pick a difficulty and press Start.")
         self._pending_live_mode   = None
         self._awaiting_arm_mode   = mode
         self._armed_mode          = mode
         self._set_mode(mode)
-        self._countdown_label.setText("Selecting mode on the glove…")
+        self._countdown_label.setText("Setting difficulty on the glove…")
         self._update_start_button()
         self._send_command(cmd)
 
@@ -2090,8 +2172,8 @@ class MainWindow(QMainWindow):
         self._score_card.set_accent(GRAY)
         self._score_delta_label.setText("Score: --")
         self._score_delta_label.setStyleSheet(f"color: {MUTED};")
-        self._countdown_label.setText("Mode selected. Press Start for a 3-second countdown.")
-        self._vital_sign.set_status(False)
+        self._countdown_label.setText("Difficulty selected. Press Start when you're ready.")
+        self._refresh_non_session_banner()
         self._update_start_button()
 
     def _start_countdown(self) -> None:
@@ -2130,13 +2212,14 @@ class MainWindow(QMainWindow):
             self._cancel_countdown("Connection lost before start.")
             return
         self._pending_live_mode  = self._armed_mode
-        self._countdown_label.setText("Starting scored session…")
+        self._countdown_label.setText("Starting session…")
         self._send_command(COMMAND_BY_MODE[self._armed_mode])
 
     def _set_countdown_text(self, text: str) -> None:
         label = f"Starting in {text}" if text != "Begin" else "Begin"
         self._countdown_label.setText(label)
         self._vital_sign.set_countdown(text)
+        self._apply_player_banner("Get ready", "", BLUE, active=False, pulse=False)
 
     def _cancel_countdown(self, message: str) -> None:
         self._countdown_timer.stop()
@@ -2144,7 +2227,7 @@ class MainWindow(QMainWindow):
         self._awaiting_arm_mode  = None
         self._pending_live_mode  = None
         self._countdown_label.setText(message)
-        self._vital_sign.set_status(False)
+        self._refresh_non_session_banner()
         self._update_start_button()
 
     def _update_start_button(self) -> None:
@@ -2177,6 +2260,9 @@ class MainWindow(QMainWindow):
             self._connect()
 
     def _connect(self) -> None:
+        # Host-side connection setup is intentionally lightweight: spawn the
+        # serial worker, reset GUI session state, and immediately identify the
+        # board with the existing 'I' command.
         port = self._port_combo.currentData()
         if not port:
             self._log("No port selected", "err")
@@ -2229,6 +2315,9 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_data_received(self, line: str) -> None:
         self._log(line, "rx")
+        # All serial input enters here as plain text. The first split is:
+        # - JSON: structured telemetry or structured status/calibration updates
+        # - plain text: simple command responses and READY banners
         if line.startswith("{"):
             try:
                 payload = json.loads(line)
@@ -2243,6 +2332,8 @@ class MainWindow(QMainWindow):
         self._handle_text_response(line)
 
     def _handle_telemetry(self, packet: dict) -> None:
+        # This path is for the high-rate runtime JSON stream: force, IMU,
+        # warnings, score, state, contact, and so on.
         self._latest_packet  = packet
         self._last_packet_at = time.monotonic()
         self._stale_label.setText("Telemetry: live")
@@ -2250,6 +2341,9 @@ class MainWindow(QMainWindow):
         if self._calibration_wizard is not None and self._calibration_wizard.isVisible():
             self._calibration_wizard.update_live_packet(packet)
         if self._session_active:
+            # Only store and score packets against a user session once Start
+            # has actually armed a mode. This prevents idle packets from
+            # polluting plots or summaries.
             self._telemetry.append(packet)
             self._packet_label.setText(f"Packets: {self._telemetry.packet_count}")
             self._packet_kpi.set_value(str(self._telemetry.packet_count))
@@ -2261,6 +2355,8 @@ class MainWindow(QMainWindow):
                 self._rate_kpi.set_value(f"{rate:.1f}")
         else:
             self._rate_label.setText("live")
+        # The firmware is the source of truth for surgical state (IDLE/HOLD/
+        # ACTIVE/EXITED), so the GUI mirrors that instead of inventing its own.
         state = str(packet.get("state", "CONNECTED"))
         self._set_state(self._state_from_text(state))
         self._update_metrics(packet, scored=self._session_active)
@@ -2269,6 +2365,9 @@ class MainWindow(QMainWindow):
         self._send_to_hand_visualizer(packet)
 
     def _handle_status_json(self, payload: dict) -> None:
+        # Non-telemetry JSON packets are mostly calibration/proof/NVS status.
+        # They still matter, but they update activity/coaching state rather
+        # than the live numeric plots.
         if "nvs" in payload:
             text = f"Calibration storage: {payload['nvs']}"
             self._add_activity(text, AMBER)
@@ -2285,6 +2384,8 @@ class MainWindow(QMainWindow):
             self._add_activity("Status JSON received", MUTED)
 
     def _handle_text_response(self, line: str) -> None:
+        # Plain-text responses are the compact command protocol: READY banners,
+        # mode changes, STOPPED, EXITED, and identification responses.
         clean = line.strip()
         response = COMMAND_RESPONSES.get(clean)
         if response is None:
@@ -2293,6 +2394,13 @@ class MainWindow(QMainWindow):
             return
         key, message = response
         if key in ("EASY", "INTERMEDIATE", "HARD"):
+            # The GUI distinguishes between:
+            # - selecting/arming a mode
+            # - starting a live training session in that mode
+            #
+            # That is why there are "awaiting arm" and "pending live" fields
+            # instead of flipping directly into session-active on every mode
+            # response.
             self._mode = key
             if self._pending_live_mode == key:
                 self._pending_live_mode = None
@@ -2304,7 +2412,7 @@ class MainWindow(QMainWindow):
                 self._awaiting_arm_mode = None
                 self._arm_training_mode(key)
                 self._add_activity(
-                    f"{MODE_LABELS[key]} mode selected – press Start when ready",
+                    f"{MODE_LABELS[key]} difficulty selected. Press Start when you're ready.",
                     MODE_COLORS[key],
                 )
         elif key == "IDLE":
@@ -2317,9 +2425,11 @@ class MainWindow(QMainWindow):
             if self._countdown_timer.isActive():
                 self._cancel_countdown("Stopped before the session started.")
             self._set_mode(self._session_mode, active=False, complete=True)
-            self._vital_sign.set_status(False)
+            self._refresh_non_session_banner(
+                headline="Session complete" if clean == "STOPPED" and was_live else None
+            )
             self._update_start_button()
-            self._add_activity(message, MUTED)
+            self._add_activity("Session stopped" if clean == "STOPPED" else message, MUTED)
             if clean == "STOPPED" and was_live:
                 self._show_session_summary()
         elif key == "EXITED":
@@ -2328,10 +2438,10 @@ class MainWindow(QMainWindow):
             self._session_active    = False
             self._awaiting_arm_mode = None
             self._pending_live_mode = None
-            self._vital_sign.set_status(False)
+            self._apply_player_banner("Session ended", "", RED, active=False, pulse=False)
             self._set_commands_enabled(False)
             self._update_start_button()
-            self._add_activity(message, RED)
+            self._add_activity("Session ended", RED)
         else:
             self._set_state(TrainerState.CONNECTED)
             self._add_activity(message, BLUE)
@@ -2343,6 +2453,9 @@ class MainWindow(QMainWindow):
             return TrainerState.CONNECTED
 
     def _begin_training_session(self, mode: str) -> None:
+        # This is the true session reset point from the GUI's perspective.
+        # All plots, counters, and score deltas are cleared here so the next
+        # run starts with a clean slate.
         self._session_mode       = mode
         self._mode               = mode
         self._armed_mode         = mode
@@ -2351,6 +2464,10 @@ class MainWindow(QMainWindow):
         self._last_warn          = 0
         self._last_err           = 0
         self._last_state         = ""
+        self._hud_level          = "stable"
+        self._hud_hold_until     = 0.0
+        self._hud_calm_since     = None
+        self._hud_last_change_at = 0.0
         self._countdown_timer.stop()
         self._countdown_value    = 0
         self._telemetry.reset()
@@ -2371,14 +2488,17 @@ class MainWindow(QMainWindow):
         self._gate_label.setStyleSheet(f"color: {MUTED};")
         self._score_delta_label.setText(f"Score: 100.0")
         self._score_delta_label.setStyleSheet(f"color: {GREEN};")
-        self._countdown_label.setText("Live session running. Press Stop to finish.")
-        self._vital_sign.set_status(True, 0, 0)
+        self._countdown_label.setText("Session live. Press Stop when finished.")
+        self._apply_player_banner("Nice control", "", GREEN, active=True, pulse=True)
         self._update_start_button()
         self._add_activity(
-            f"New {MODE_LABELS[mode].lower()} session started – score reset to 100", BLUE
+            f"{MODE_LABELS[mode]} session started. Score reset to 100.", BLUE
         )
 
     def _reset_session_display(self, clear_mode: bool = False) -> None:
+        # Used when disconnecting, stopping, or cancelling before a live run
+        # truly starts. It clears the GUI-side session artifacts without
+        # touching the board directly.
         self._countdown_timer.stop()
         self._countdown_value   = 0
         self._pending_live_mode = None
@@ -2387,6 +2507,13 @@ class MainWindow(QMainWindow):
         self._last_warn         = 0
         self._last_err          = 0
         self._last_state        = ""
+        self._hud_level         = "idle"
+        self._hud_headline      = ""
+        self._hud_detail        = ""
+        self._hud_color         = MUTED
+        self._hud_hold_until    = 0.0
+        self._hud_calm_since    = None
+        self._hud_last_change_at = 0.0
         self._telemetry.reset()
         self._clear_plots()
         self._score_card.set_value("--")
@@ -2403,11 +2530,9 @@ class MainWindow(QMainWindow):
         self._gate_label.setStyleSheet(f"color: {MUTED};")
         self._score_delta_label.setText("Score: --")
         self._score_delta_label.setStyleSheet(f"color: {MUTED};")
-        self._alert_label.setText("No active warnings")
-        self._alert_label.setStyleSheet(f"color: {GREEN};")
-        self._vital_sign.set_status(False)
+        self._refresh_non_session_banner()
         if hasattr(self, "_countdown_label"):
-            self._countdown_label.setText("Select a mode, then press Start.")
+            self._countdown_label.setText("Pick a difficulty, then press Start.")
         for metric in self._metric_values.values():
             metric.set_value("--")
             metric.set_accent(BLUE)
@@ -2423,15 +2548,15 @@ class MainWindow(QMainWindow):
         label = MODE_LABELS.get(mode, mode.title())
         color = MODE_COLORS.get(mode, MUTED)
         if mode == "UNSELECTED":
-            text = "No mode selected"
+            text = "No difficulty selected"
         elif complete:
-            text = f"Last: {label}"
+            text = f"Last run: {label}"
         elif active:
-            text = f"Active: {label}"
+            text = f"{label} live"
         elif countdown:
-            text = f"Starting: {label}"
+            text = f"{label} starting"
         else:
-            text = f"Selected: {label}"
+            text = f"{label} selected"
 
         self._mode_label.setText(text)
         self._mode_label.setStyleSheet(
@@ -2443,23 +2568,8 @@ class MainWindow(QMainWindow):
             "font-weight: 900; font-size: 11px;"
         )
 
-        # Update session banner border color
-        state_color = color if active else (MUTED if mode == "UNSELECTED" else color)
-        if hasattr(self, "_session_banner"):
-            self._session_banner.setStyleSheet(
-                "QFrame#session_banner {"
-                f"border-left: 4px solid {state_color};"
-                "}"
-            )
-
-        # Update state label text
-        if not active and not countdown:
-            if hasattr(self, "_state_label"):
-                disp = STATE_COLORS.get(self._state_from_text(self._last_state), MUTED)
-                self._state_label.setText(
-                    "Session idle" if mode == "UNSELECTED" else
-                    f"{label} — Ready"
-                )
+        if not self._session_active and not countdown:
+            self._refresh_non_session_banner()
 
         # Update mode button visual states
         active_cmd = {"EASY": "E", "INTERMEDIATE": "M", "HARD": "H"}.get(mode)
@@ -2483,6 +2593,9 @@ class MainWindow(QMainWindow):
         )
 
     def _build_session_summary(self) -> dict:
+        # Summaries are computed from the GUI's telemetry cache, not re-asked
+        # from the firmware. That keeps the board protocol simple and makes the
+        # summary reproducible from exactly what the user saw live.
         def values(key: str) -> list[float]:
             return self._telemetry.y(key)
         times    = self._telemetry.x()
@@ -2506,17 +2619,17 @@ class MainWindow(QMainWindow):
         avg_tremor      = (sum(tremor) / len(tremor)) if tremor else 0.0
         peak_f95        = max(f95) if f95 else 0.0
         if final_score >= 90 and error_events == 0:
-            grade, grade_color = "Expert control", GREEN
-            coaching = "Clean session. Force stayed controlled and no major error events were recorded."
+            grade, grade_color = "Excellent control", GREEN
+            coaching = "Strong run. Your grip stayed controlled and the trainer saw no major correction events."
         elif final_score >= 75 and error_events == 0:
-            grade, grade_color = "Good technique", BLUE
-            coaching = "Good run. Review warning moments and keep force changes smooth."
+            grade, grade_color = "Solid control", BLUE
+            coaching = "Good run. Keep smoothing out the warning moments and keep the grip light."
         elif final_score >= 50:
-            grade, grade_color = "Needs refinement", AMBER
-            coaching = "Usable session, but force or motion stability needs more consistency."
+            grade, grade_color = "Building consistency", AMBER
+            coaching = "You completed the run. Focus next on steadier hand motion and gentler force changes."
         else:
-            grade, grade_color = "High-risk handling", RED
-            coaching = "High event count or low score. Repeat at an easier mode and focus on gentle contact."
+            grade, grade_color = "Keep practicing", RED
+            coaching = "This run was tough. Try an easier difficulty and focus on gentle contact and smoother motion."
         if samples == 0:
             coaching = "No live telemetry was captured for this session. Start a mode, interact with the glove, then press Stop."
         return {
@@ -2528,7 +2641,152 @@ class MainWindow(QMainWindow):
             "coaching": coaching,
         }
 
+    def _severity_rank(self, level: str) -> int:
+        return {"idle": -1, "stable": 0, "warn": 1, "err": 2}.get(level, -1)
+
+    def _set_banner_accent(self, color: str) -> None:
+        if hasattr(self, "_session_banner"):
+            self._session_banner.setStyleSheet(
+                "QFrame#session_banner {"
+                f"background-color: {PANEL};"
+                f"border: 1px solid {BORDER};"
+                f"border-left: 4px solid {color};"
+                "border-radius: 12px;"
+                "}"
+            )
+
+    def _apply_player_banner(
+        self,
+        headline: str,
+        detail: str,
+        color: str,
+        *,
+        active: bool,
+        pulse: bool,
+    ) -> None:
+        self._state_label.setText(headline)
+        self._state_label.setStyleSheet(f"color: {color};")
+        self._set_banner_accent(color)
+        self._vital_sign.set_status(active, headline, detail, color, pulse)
+        self._hud_headline = headline
+        self._hud_detail = detail
+        self._hud_color = color
+
+    def _refresh_non_session_banner(
+        self,
+        headline: str | None = None,
+        *,
+        state: TrainerState | None = None,
+        color: str | None = None,
+    ) -> None:
+        if self._session_active or self._countdown_timer.isActive():
+            return
+        current_state = state or self._state_from_text(self._last_state or "CONNECTED")
+        if not self._connected or current_state == TrainerState.DISCONNECTED:
+            headline = headline or "Connect glove"
+            banner_color = MUTED
+        elif current_state == TrainerState.EXITED:
+            headline = headline or "Session ended"
+            banner_color = RED
+        elif headline == "Session complete":
+            banner_color = BLUE
+        elif self._mode == "UNSELECTED":
+            headline = headline or "Choose difficulty"
+            banner_color = BLUE
+        else:
+            headline = headline or "Ready"
+            banner_color = color or MODE_COLORS.get(self._mode, BLUE)
+        self._hud_level = "idle"
+        self._hud_hold_until = 0.0
+        self._hud_calm_since = None
+        self._apply_player_banner(headline, "", banner_color, active=False, pulse=False)
+
+    def _coaching_signal(self, warn: int, err: int, state: str) -> tuple[str, str, str, str]:
+        motion_warn = warn & ((1 << 0) | (1 << 1) | (1 << 3))
+        force_warn = warn & ((1 << 2) | (1 << 4) | (1 << 5) | (1 << 6))
+        finger_warn = warn & ((1 << 4) | (1 << 5) | (1 << 6))
+        motion_err = err & ((1 << 0) | (1 << 1))
+        force_err = err & ((1 << 2) | (1 << 3))
+
+        if err:
+            if motion_err and force_err:
+                return ("err", "Reset control", "", RED)
+            if force_err:
+                return ("err", "Too much force", "", RED)
+            if motion_err:
+                return ("err", "Steady hand", "", RED)
+            return ("err", "Reset control", "", RED)
+
+        if warn:
+            if motion_warn and force_warn:
+                return ("warn", "Reset gently", "", AMBER)
+            if finger_warn:
+                return ("warn", "Relax fingers", "", AMBER)
+            if force_warn:
+                return ("warn", "Ease grip", "", AMBER)
+            if motion_warn:
+                return ("warn", "Steady hand", "", AMBER)
+            return ("warn", "Small correction", "", AMBER)
+
+        if state in ("HOLD", "ACTIVE"):
+            return ("stable", "Nice control", "", GREEN)
+        return ("stable", "Ready", "", GREEN)
+
+    def _apply_sticky_coaching(self, level: str, text: str, detail: str, color: str) -> None:
+        now = time.monotonic()
+        current_rank = self._severity_rank(self._hud_level)
+        target_rank = self._severity_rank(level)
+
+        def commit(target_level: str, target_text: str, target_detail: str, target_color: str) -> None:
+            self._hud_level = target_level
+            self._hud_hold_until = now + HUD_RECOVERY_DELAY_S if self._severity_rank(target_level) > 0 else 0.0
+            self._hud_calm_since = None
+            self._hud_last_change_at = now
+            self._apply_player_banner(
+                target_text,
+                target_detail,
+                target_color,
+                active=self._session_active and self._severity_rank(target_level) >= 0,
+                pulse=self._severity_rank(target_level) >= 0,
+            )
+
+        if target_rank > current_rank:
+            commit(level, text, detail, color)
+            return
+
+        if target_rank == current_rank and target_rank > 0:
+            if text == self._hud_headline:
+                self._hud_hold_until = now + HUD_RECOVERY_DELAY_S
+                self._hud_calm_since = None
+            elif now - self._hud_last_change_at >= HUD_SAME_LEVEL_SWAP_S:
+                commit(level, text, detail, color)
+            return
+
+        if 0 < target_rank < current_rank:
+            if self._hud_calm_since is None:
+                self._hud_calm_since = now
+            if now >= self._hud_hold_until and (now - self._hud_calm_since) >= HUD_CALM_STREAK_S:
+                commit(level, text, detail, color)
+            return
+
+        if target_rank == 0 and current_rank > 0:
+            if self._hud_calm_since is None:
+                self._hud_calm_since = now
+            if now >= self._hud_hold_until and (now - self._hud_calm_since) >= HUD_CALM_STREAK_S:
+                commit(level, text, detail, color)
+            return
+
+        if target_rank == 0 and (
+            self._hud_level != "stable"
+            or self._hud_headline != text
+            or self._hud_detail != detail
+        ):
+            commit(level, text, detail, color)
+
     def _update_metrics(self, packet: dict, scored: bool = True) -> None:
+        # This is the main "packet -> visible numbers" adapter. Most widgets do
+        # not parse raw JSON directly; they are fed normalized display strings
+        # and accent colors here.
         def f(key: str, default: float = 0.0) -> float:
             return float(packet.get(key, default))
         score       = f("score")
@@ -2578,39 +2836,31 @@ class MainWindow(QMainWindow):
         self._gate_label.setStyleSheet(f"color: {gate_color};")
 
     def _update_coaching(self, packet: dict) -> None:
+        # The firmware decides when a warning/error exists; the GUI's job is to
+        # translate that into coaching language and smooth rapid packet-to-packet
+        # flips so the banner reads like a training HUD rather than a debug feed.
         warn  = int(packet.get("warn", 0))
         err   = int(packet.get("err", 0))
         state = str(packet.get("state", ""))
-        if err:
-            messages = self._flag_messages(err, ERR_LABELS)
-            text  = "Error: " + ", ".join(messages)
-            color = RED
-            if err != self._last_err:
-                self._add_activity(text, RED)
-        elif warn:
-            messages = self._flag_messages(warn, WARN_LABELS)
-            text  = "Warning: " + ", ".join(messages)
-            color = AMBER
-            if warn != self._last_warn:
-                self._add_activity(text, AMBER)
-        else:
-            text  = "Stable technique" if state in ("HOLD", "ACTIVE") else "Ready for contact"
-            color = GREEN
-        self._state_label.setText(text)
-        self._state_label.setStyleSheet(f"color: {color};")
-        self._alert_label.setText(f"Warn 0x{warn:02X} | Err 0x{err:02X}")
-        self._alert_label.setStyleSheet(f"color: {RED if err else AMBER if warn else GREEN};")
-        self._vital_sign.set_status(self._session_active, warn, err)
+        self._alert_label.setText("Telemetry: live")
+        self._alert_label.setStyleSheet(f"color: {GREEN};")
+        level, text, detail, color = self._coaching_signal(warn, err, state)
+        self._apply_sticky_coaching(level, text, detail, color)
+        if err and err != self._last_err:
+            self._add_activity(text, RED)
+        elif warn and warn != self._last_warn:
+            self._add_activity(text, AMBER)
         if state and state != self._last_state:
             self._add_activity(
-                f"State changed to {state}",
+                f"Training state changed to {state}",
                 STATE_COLORS.get(self._state_from_text(state), MUTED),
             )
         self._last_warn  = warn
         self._last_err   = err
         self._last_state = state
 
-    def _flag_messages(self, flags: int, labels: dict[int, str]) -> list[str]:
+    def _flag_messages(self, flags: int, labels: dict[int, str] | None = None) -> list[str]:
+        labels = labels or WARN_COACH_LABELS
         messages = [label for bit, label in labels.items() if flags & bit]
         return messages or [f"0x{flags:02X}"]
 
@@ -2651,8 +2901,14 @@ class MainWindow(QMainWindow):
         if age > 2.0:
             self._stale_label.setText(f"Telemetry: stale {age:.1f}s")
             self._stale_label.setStyleSheet(f"color: {RED};")
-            self._state_label.setText("Telemetry paused – waiting for live packets")
-            self._state_label.setStyleSheet(f"color: {RED};")
+            if self._session_active:
+                self._apply_player_banner(
+                    "Waiting",
+                    "",
+                    RED,
+                    active=False,
+                    pulse=False,
+                )
 
     def _check_hand_process(self) -> None:
         if self._hand_process is None:
@@ -2813,6 +3069,9 @@ class MainWindow(QMainWindow):
             self._disconnect()
 
     def _send_command(self, cmd: str) -> None:
+        # Commands are always queued, never written directly from the GUI
+        # thread. That keeps button clicks responsive even if the serial driver
+        # stalls or the USB link hiccups.
         if not self._connected:
             self._add_activity("Connect to the glove before sending commands.", AMBER)
             if self._calibration_wizard is not None and self._calibration_wizard.isVisible():
@@ -2828,12 +3087,13 @@ class MainWindow(QMainWindow):
         self._add_activity(f"Command sent: {cmd}", BLUE)
 
     def _set_state(self, state: TrainerState) -> None:
+        # This updates only the host-side visual state; it does not command the
+        # board. The board remains the source of truth for runtime state.
         color = STATE_COLORS[state]
-        if hasattr(self, "_state_label"):
-            self._state_label.setText(state.value)
-            self._state_label.setStyleSheet(f"color: {color};")
         if state == TrainerState.EXITED:
             self._set_commands_enabled(False)
+        if not self._session_active and not self._countdown_timer.isActive():
+            self._refresh_non_session_banner(state=state, color=color)
 
     def _set_commands_enabled(self, enabled: bool) -> None:
         for button in getattr(self, "_cmd_buttons", []):
@@ -2937,7 +3197,7 @@ DESIGN REGISTRY — new objectNames introduced in this redesign:
   app_bar           — fixed 64px top application bar (Zone 1)
   app_title         — "Haptic Surgical Skill Trainer" bold NAVY label in bar
   app_subtitle      — "Clinical Training Console" muted subtitle in bar
-  app_icon          — small navy rounded square icon placeholder in bar
+  app_icon          — fixed 36px navy rounded-square logo using the scissors PNG
   status_pill       — connection state badge (DISCONNECTED/CONNECTED) in bar
   rate_chip         — packet rate monospace label in bar
   port_combo        — port selector QComboBox in bar
@@ -2945,7 +3205,6 @@ DESIGN REGISTRY — new objectNames introduced in this redesign:
   tab_active=true   — selected state for tab_pill (via QSS property selector)
   session_banner    — full-width rounded card at top of Train tab
   banner_stat       — small stat labels (Packets, Contact, Telemetry) in banner
-  vital_header      — "LIVE VITAL" all-caps label above waveform in banner
   score_inline      — inline Score: XX.X label in banner meta row
   kpi_card          — summary metric card with left-border accent (replaces summary_card in Train)
   kpi_label         — all-caps MUTED label in kpi_card
@@ -2987,18 +3246,13 @@ QFrame#app_bar {{
 }}
 QLabel#app_title {{
     color: {NAVY};
-    font-size: 15px;
-    font-weight: 800;
+    font-size: 16px;
+    font-weight: 900;
 }}
 QLabel#app_subtitle {{
-    color: {MUTED};
-    font-size: 11px;
-    font-weight: 500;
-}}
-QFrame#app_icon {{
-    background-color: {NAVY};
-    border-radius: 8px;
-    border: none;
+    color: {TEXT};
+    font-size: 10px;
+    font-weight: 600;
 }}
 QLabel#rate_chip {{
     color: {MUTED};

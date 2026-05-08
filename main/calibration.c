@@ -37,12 +37,14 @@ static const char *TAG = "CAL";
 #define CAL_C3_GRIP_OMEGA_MAX_DPS     12.0f
 #define CAL_C3_FREE_MOTION_SAMPLES    250
 #define CAL_C3_FREE_TIMEOUT_SAMPLES   450
+#define CAL_C4_HAND_MOTION_SAMPLES   1000
+#define CAL_C4_HAND_TIMEOUT_SAMPLES  1300
 #define CAL_C3_MOTION_START_DPS       8.0f
 #define CAL_C3_MOTION_MIN_PP_DEG      6.0f
 #define CAL_C3_MOTION_MIN_OMEGA_RMS   6.0f
 #define CAL_DIRECTION_WINDOW_SAMPLES 520
 #define CAL_FIG8_WINDOW_SAMPLES      700
-#define CAL_WORKSPACE_MAX_SAMPLES    CAL_FIG8_WINDOW_SAMPLES
+#define CAL_WORKSPACE_MAX_SAMPLES    CAL_C4_HAND_MOTION_SAMPLES
 
 static raw_sample_t s_c1_samples[CAL_C1_SAMPLES];
 static float s_cal_omega_window[CAL_WORKSPACE_MAX_SAMPLES];
@@ -416,7 +418,7 @@ static esp_err_t run_c4_hand_motion(QueueHandle_t raw_q,
     processing_tremor_baseline_reset();
     emit_c4_stage_event(stage, "prompt", 0.0f, "", "", "");
 
-    for (int i = 0; i < CAL_C3_FREE_TIMEOUT_SAMPLES; i++) {
+    for (int i = 0; i < CAL_C4_HAND_TIMEOUT_SAMPLES; i++) {
         raw_sample_t samp;
         if (xQueueReceive(raw_q, &samp, pdMS_TO_TICKS(CAL_QUEUE_TIMEOUT_MS)) != pdTRUE) {
             emit_c4_stage_event(stage, "fail", 0.0f, "timeout", "", "");
@@ -445,7 +447,7 @@ static esp_err_t run_c4_hand_motion(QueueHandle_t raw_q,
             continue;
         }
 
-        if (samples < CAL_C3_FREE_MOTION_SAMPLES) {
+        if (samples < CAL_C4_HAND_MOTION_SAMPLES) {
             omega_window[samples] = omega_mag;
             roll_window[samples] = roll_delta;
             pitch_window[samples] = pitch_delta;
@@ -454,17 +456,17 @@ static esp_err_t run_c4_hand_motion(QueueHandle_t raw_q,
         }
 
         if (i % CAL_STAGE_LIVE_STRIDE == 0) {
-            float progress = (float)samples / (float)CAL_C3_FREE_MOTION_SAMPLES;
+            float progress = (float)samples / (float)CAL_C4_HAND_MOTION_SAMPLES;
             if (progress > 0.99f) progress = 0.99f;
             emit_c4_stage_event(stage, "capturing", progress, "", "", "");
         }
 
-        if (samples >= CAL_C3_FREE_MOTION_SAMPLES) {
+        if (samples >= CAL_C4_HAND_MOTION_SAMPLES) {
             break;
         }
     }
 
-    if (samples < CAL_C3_FREE_MOTION_SAMPLES) {
+    if (samples < CAL_C4_HAND_MOTION_SAMPLES) {
         emit_c4_stage_event(stage, "fail", 1.0f, "motion_too_short", "", "");
         return ESP_FAIL;
     }
