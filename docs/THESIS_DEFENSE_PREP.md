@@ -59,9 +59,18 @@ tools all exist in the repo as first-class components.
 
 **What they may challenge**
 
-- "Is this just a sensor demo?"
-- "Is the GUI superficial?"
-- "Where is the actual systems design?"
+- **Challenge: "Is this just a sensor demo?"**  
+  **Answer:** No. The firmware has a timer-driven acquisition path, a separate
+  low-priority control path, a queue-based inter-core boundary, and a Core 1
+  processing pipeline. That is systems design, not just sensor reading.
+- **Challenge: "Is the GUI superficial?"**  
+  **Answer:** No. The GUI is a real protocol consumer that drives calibration and
+  control, and the repo also includes Python proof and diagnostic tools built on
+  the same telemetry/control boundary.
+- **Challenge: "Where is the actual systems design?"**  
+  **Answer:** In the timer/semaphore wake path, the Core 0 to Core 1 queue
+  handoff, the task pinning and priorities, and the host-side protocol tooling.
+  Those are first-class architectural decisions in the codebase.
 
 ## 2. System Overview
 
@@ -107,8 +116,14 @@ Queue creation, core pinning, and the producer-consumer comments are explicit in
 
 **What they may challenge**
 
-- "Why split across cores at all?"
-- "Why use a queue instead of globals?"
+- **Challenge: "Why split across cores at all?"**  
+  **Answer:** Because acquisition has a fixed 10 ms cadence, while processing and
+  telemetry have more variable latency. The split gives timing isolation so
+  heavier Core 1 work does not directly compete with the acquisition deadline.
+- **Challenge: "Why use a queue instead of globals?"**  
+  **Answer:** Because the queue creates a clean producer-consumer boundary.
+  Core 0 produces complete `raw_sample_t` packets, and Core 1 consumes copies of
+  them without ad hoc shared mutable state.
 
 ## 3. Code Callout Map
 
@@ -136,7 +151,10 @@ Each entry points at the current implementation, not just comments in prose.
 
 **What they may challenge**
 
-- "Are these comments, or is there real logic there?"
+- **Challenge: "Are these comments, or is there real logic there?"**  
+  **Answer:** There is real logic there. Each anchor points to an active runtime
+  path such as timer setup, semaphore blocking, queue transfer, filter execution,
+  proof packet assembly, or JSON serialization.
 
 ## 3.1 Important Module-by-Module Callouts
 
@@ -373,9 +391,17 @@ monitor all exist in the codebase.
 
 **What they may challenge**
 
-- "How do you know it is 100 Hz and not just approximately 100 Hz?"
-- "Is the 20 Hz JSON stream your real sample rate?"
-- "What exactly is the deadline?"
+- **Challenge: "How do you know it is 100 Hz and not just approximately 100 Hz?"**  
+  **Answer:** Because the timer is explicitly started at 10,000 microseconds per
+  period, which is 10 ms, and the repo also includes measured-rate logging, a
+  proof pin, a host timing monitor, and an `actual_hz` telemetry field.
+- **Challenge: "Is the 20 Hz JSON stream your real sample rate?"**  
+  **Answer:** No. The internal acquisition and processing cadence is 100 Hz. The
+  20 Hz stream is decimated host telemetry produced every 5th sample.
+- **Challenge: "What exactly is the deadline?"**  
+  **Answer:** The deadline is one full acquisition cycle per 10 ms timer tick:
+  ADC reads, IMU read attempt, sample packaging, and queue handoff all have to
+  stay within that schedule.
 
 ## 5. Interrupts and Asynchronous Sources
 
@@ -448,8 +474,14 @@ in the code.
 
 **What they may challenge**
 
-- "Is a stop command an interrupt?"
-- "If UART2 is read in the acquisition task, why do you call it asynchronous?"
+- **Challenge: "Is a stop command an interrupt?"**  
+  **Answer:** No. `STOP` is one meaning of UART0 data arrival. The asynchronous
+  source is the UART receive event itself; the command meaning is interpreted
+  afterward.
+- **Challenge: "If UART2 is read in the acquisition task, why do you call it asynchronous?"**  
+  **Answer:** Because the IMU still produces serial bytes independently of the
+  application flow. The application-side read is scheduled, but the
+  peripheral-side data arrival is asynchronous.
 
 ## 6. Multitasking Design
 
@@ -519,8 +551,14 @@ The firmware records the event chain, and the host proof dashboard displays
 
 **What they may challenge**
 
-- "Is `control_task` a fake task made only for the demo?"
-- "How do you know the proof tool is not inventing the timeline?"
+- **Challenge: "Is `control_task` a fake task made only for the demo?"**  
+  **Answer:** No. It is the real low-priority Core 0 control-plane task that
+  handles UART ingress, mode changes, calibration coordination, and proof-mode
+  control.
+- **Challenge: "How do you know the proof tool is not inventing the timeline?"**  
+  **Answer:** Because the host dashboard consumes proof snapshots assembled from
+  raw firmware event timestamps on Core 1. It is displaying instrumented firmware
+  events, not guessing from host-side packet timing.
 
 ## 7. Dual-Core / Parallel Architecture
 
@@ -570,8 +608,13 @@ code.
 
 **What they may challenge**
 
-- "Why not do everything on one core?"
-- "Why not share globals instead of copying samples through a queue?"
+- **Challenge: "Why not do everything on one core?"**  
+  **Answer:** Because one-core designs mix time-critical sampling with
+  variable-latency processing, calibration, and telemetry. The dual-core split
+  gives the acquisition path timing isolation.
+- **Challenge: "Why not share globals instead of copying samples through a queue?"**  
+  **Answer:** Because the queue makes ownership and synchronization explicit. It
+  is cleaner and easier to reason about than shared cross-core mutable state.
 
 ## 8. FreeRTOS and Why It Was Used
 
@@ -627,8 +670,13 @@ The timer/semaphore/queue/task architecture is everywhere in the current code.
 
 **What they may challenge**
 
-- "Could you have done this without FreeRTOS?"
-- "What did the RTOS actually buy you?"
+- **Challenge: "Could you have done this without FreeRTOS?"**  
+  **Answer:** In principle yes, but the structure would be much weaker. FreeRTOS
+  is what makes the timer/semaphore wake model, safe queue handoff, priority
+  separation, and blocking behavior explicit instead of ad hoc.
+- **Challenge: "What did the RTOS actually buy you?"**  
+  **Answer:** Deterministic wakeups, explicit priorities, safe inter-core
+  communication, and tasks that block when idle instead of polling constantly.
 
 ## 8.1 Task Priorities and Why They Were Chosen
 
@@ -798,10 +846,22 @@ The priorities and the rationale comments are documented in
 
 **What they may challenge**
 
-- “Why 10 instead of 5?”
-- “Why is control only 1?”
-- “Why is processing 9?”
-- “What would change if these priorities were swapped?”
+- **Challenge: “Why 10 instead of 5?”**  
+  **Answer:** Because the exact number is less important than the ordering, but
+  10 makes the hierarchy clear: well above low-priority control and still below
+  the framework-owned timer-dispatch context.
+- **Challenge: “Why is control only 1?”**  
+  **Answer:** Because it is real control-plane work, but it is not
+  deadline-critical and must lose to the real-time acquisition path whenever
+  there is contention on Core 0.
+- **Challenge: “Why is processing 9?”**  
+  **Answer:** Because it still needs to be high priority on Core 1 so it keeps
+  up with the queue stream, but it is intentionally one step below acquisition in
+  the design story.
+- **Challenge: “What would change if these priorities were swapped?”**  
+  **Answer:** The design would be weaker: low-priority control could interfere
+  more with sampling, and the scheduling argument for the Core 0 multitasking
+  proof would be much less clean.
 
 ## 9. Signal Processing and Butterworth Filters
 
@@ -865,9 +925,16 @@ repo.
 
 **What they may challenge**
 
-- "Why Butterworth instead of a moving average?"
-- "Why band-pass 6-12 Hz?"
-- "Are you actually implementing the filter yourselves?"
+- **Challenge: "Why Butterworth instead of a moving average?"**  
+  **Answer:** Because the project needs more than generic smoothing. It needs
+  both smoothing and controlled frequency shaping, including tremor-band
+  isolation.
+- **Challenge: "Why band-pass 6-12 Hz?"**  
+  **Answer:** Because the current tremor feature definition is built around that
+  band, and both runtime and calibration logic are shaped consistently around it.
+- **Challenge: "Are you actually implementing the filter yourselves?"**  
+  **Answer:** Yes. The repo contains the biquad primitive and the fixed
+  coefficients for the low-pass and band-pass stages directly in `filters.c`.
 
 ## 10. Sampling Rate and Frequency Choice
 
@@ -924,8 +991,13 @@ Filter definitions, window sizes, and the DFT budget comment are all anchored to
 
 **What they may challenge**
 
-- "Who decided 100 Hz?"
-- "Why not sample slower or faster?"
+- **Challenge: "Who decided 100 Hz?"**  
+  **Answer:** The current codebase did, in the sense that the DSP, window sizes,
+  and feature pipeline are all explicitly designed around 100 Hz.
+- **Challenge: "Why not sample slower or faster?"**  
+  **Answer:** Slower rates give less headroom for the motion band of interest;
+  faster rates increase compute and serial pressure without a clearly justified
+  benefit in the current design.
 
 ## 11. Telemetry Design
 
@@ -963,8 +1035,13 @@ The packet format and the 20 Hz throttling are explicit in the runtime code.
 
 **What they may challenge**
 
-- "Why not binary?"
-- "Is JSON too expensive for an embedded system?"
+- **Challenge: "Why not binary?"**  
+  **Answer:** Because the host boundary in this project values inspectability and
+  ease of parsing. JSON is readable, easy to debug, and easy to extend.
+- **Challenge: "Is JSON too expensive for an embedded system?"**  
+  **Answer:** It would be a problem if sent at full internal rate, but the design
+  avoids that by decimating runtime telemetry to 20 Hz and using the UART TX
+  buffer to absorb bursts.
 
 ## 12. Python vs LabVIEW
 
@@ -1021,8 +1098,14 @@ telemetry/control model.
 
 **What they may challenge**
 
-- "Why not LabVIEW if this is instrumentation-heavy?"
-- "What do you gain technically from Python?"
+- **Challenge: "Why not LabVIEW if this is instrumentation-heavy?"**  
+  **Answer:** Because the host side needed more than visualization. It needed a
+  GUI, serial parsing, calibration orchestration, proof tooling, and reusable
+  diagnostics in one version-controlled codebase.
+- **Challenge: "What do you gain technically from Python?"**  
+  **Answer:** One host stack for multiple roles, direct JSON handling, scriptable
+  diagnostics, source-reviewable logic, and easy reuse across GUI and proof
+  tools.
 
 ## 13. Calibration Design
 
@@ -1111,8 +1194,14 @@ Each stage has a dedicated calibration function and writes specific fields into
 
 **What they may challenge**
 
-- "What exactly is calibrated?"
-- "Why not use fixed thresholds for everyone?"
+- **Challenge: "What exactly is calibrated?"**  
+  **Answer:** IMU bias and neutral pose, tremor baseline, FSR mean/sigma
+  baselines, contact thresholds, reference grip force, and normal-motion
+  references.
+- **Challenge: "Why not use fixed thresholds for everyone?"**  
+  **Answer:** Because sensor fit, hand size, baseline pressure, and natural
+  movement vary too much from user to user. Calibration makes the runtime logic
+  user-aware.
 
 ## 14. Scoring and Threshold Design
 
@@ -1191,9 +1280,18 @@ separately and are wired together in the current code.
 
 **What they may challenge**
 
-- "How are thresholds actually computed?"
-- "What is learned versus fixed?"
-- "Why are difficulty modes meaningful?"
+- **Challenge: "How are thresholds actually computed?"**  
+  **Answer:** Some come directly from calibration, such as contact thresholds and
+  reference force; others come from fixed mode constants; runtime logic combines
+  both when it sets warnings, errors, and score penalties.
+- **Challenge: "What is learned versus fixed?"**  
+  **Answer:** Learned values are the personalized baselines from calibration.
+  Fixed values are things like mode multipliers, floors, and the structure of the
+  warning/error policy.
+- **Challenge: "Why are difficulty modes meaningful?"**  
+  **Answer:** Because they do not just rename one threshold. They retune
+  multiple tolerance dimensions such as force, tremor, hold instability, and
+  scoring penalties.
 
 ## 15. Likely Challenge Questions with Suggested Answers
 
