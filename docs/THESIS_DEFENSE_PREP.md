@@ -138,6 +138,157 @@ Each entry points at the current implementation, not just comments in prose.
 
 - "Are these comments, or is there real logic there?"
 
+## 3.1 Important Module-by-Module Callouts
+
+If a professor asks you to move beyond the architecture diagram and point at the
+actual implementation boundaries, these are the modules to call out first.
+
+### `main/main.c` — system assembly
+
+- queue creation:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:59)
+- UART0 driver install:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:82)
+- processing/control module init:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:109)
+- task pinning and priority decisions:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:113)
+
+**Why this module matters**  
+This is the system-composition file. It shows that the architecture is not just
+conceptual; the queue, UART driver, module init, core pinning, and priority
+choices are all wired together here.
+
+### `main/acquisition.c` — real-time acquisition
+
+- timer callback:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:137)
+- IMU packet reader:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:165)
+- timer creation and 100 Hz start:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:288)
+- acquisition loop:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:307)
+- queue handoff to Core 1:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:383)
+
+**Why this module matters**  
+This is the real-time heart of the system. If someone questions your sampling
+rate, timer model, or what exactly happens every 10 ms, this is the file.
+
+### `main/control.c` — low-priority Core 0 control plane
+
+- role statement:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:15)
+- command dispatch:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:50)
+- UART event consumption:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:133)
+- task body and proof-mode behavior:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:163)
+
+**Why this module matters**  
+This file proves that the low-priority task in the multitasking proof is real
+project work, not an artificial spinner inserted just for the demo.
+
+### `main/processing.c` — filtering, state, scoring, telemetry
+
+- processing task loop:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:828)
+- FSR filtering:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:870)
+- IMU filtering and tremor band-pass:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:878)
+- feature extraction:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:918)
+- state detection and engagement gate:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:954)
+- warning/error logic:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1011)
+- running score:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1089)
+- runtime JSON serialization:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1098)
+
+**Why this module matters**  
+This file is where raw data becomes interpretable state. If someone asks where
+the actual “skill trainer” logic lives, this is the strongest answer.
+
+### `main/filters.c` and `main/filters.h` — DSP primitives
+
+- Direct Form II Transposed biquad:
+  [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:15)
+- 12 Hz low-pass:
+  [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:26)
+- 6-12 Hz band-pass:
+  [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:47)
+- 10 Hz low-pass:
+  [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:80)
+- filter interfaces and intended use:
+  [main/filters.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.h:27)
+
+**Why this module matters**  
+This proves the DSP is real implementation work, not library magic or raw-data
+thresholding.
+
+### `main/calibration.c` — personalization logic
+
+- C1 still-hand baseline:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1039)
+- C2 no-pressure/contact threshold learning:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1136)
+- C3 grip reference:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1217)
+- C4 normal motion reference:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1253)
+- independent step dispatcher:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1302)
+
+**Why this module matters**  
+This file shows that calibration is not cosmetic. It computes the user-specific
+references that later shape runtime thresholds and interpretation.
+
+### `main/data_types.h` — shared runtime contract
+
+- inter-core sample struct:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:30)
+- persisted calibration struct:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:67)
+- force, tremor, hold, and score constants:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:109)
+- warning/error bitmasks:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:199)
+
+**Why this module matters**  
+This is the best place to show how the project encodes its assumptions:
+sample shape, calibration state, thresholds, difficulty constants, and bitmasks.
+
+### `gui/esp32_controller.py` — host runtime consumer
+
+- file-level purpose:
+  [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:1)
+- JSON routing:
+  [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:2319)
+- high-rate telemetry handling:
+  [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:2334)
+
+**Why this module matters**  
+This shows that the GUI is a real protocol consumer and validation surface, not
+just a pretty shell around the firmware.
+
+### `tests/multitask_proof.py` and `tests/dual_core_monitor.py` — live proof tools
+
+- proof-mode activation and packet handling:
+  [tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py:237)
+- proof dashboard rendering:
+  [tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py:340)
+- dual-core timing monitor:
+  [tests/dual_core_monitor.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/dual_core_monitor.py:254)
+
+**Why this module matters**  
+These tools are the bridge between the firmware design claims and a live demo.
+They are part of the technical validation story.
+
 ## 4. Real-Time Design
 
 ### What real-time means here
@@ -234,6 +385,11 @@ The three important asynchronous sources in the current implementation are:
 2. UART0 RX events from the host
 3. UART2 IMU serial packet arrival/read path
 
+These are best defended as **asynchronous event sources** or
+**interrupt-driven paths**. Do **not** overstate this as "three explicit
+application ISRs we wrote ourselves," because the current implementation also
+relies on ESP-IDF timer and UART driver infrastructure.
+
 ### `esp_timer`
 
 - **Implementation fact**: `timer_isr_cb()` is the periodic timing source in
@@ -265,6 +421,20 @@ The three important asynchronous sources in the current implementation are:
   main application flow. The firmware then consumes that arrival stream from the
   UART driver buffer during each acquisition cycle. It is asynchronous at the
   peripheral/driver level even though the application-side read is scheduled.
+
+### Plain-English explanation
+
+If you need to explain this to someone who has never used an IMU, say it this
+way:
+
+- the IMU is the motion sensor
+- UART2 is the separate serial connection used to listen to that sensor
+- the IMU sends motion information on that line whenever it is ready
+- the firmware then picks up that data and turns it into usable movement values
+
+That is also why the IMU path is different from the FSR path: the IMU pushes
+serial data toward the ESP32, while the FSR sensors are simply analog inputs
+that the firmware samples on schedule.
 
 **What to say**
 
@@ -472,7 +642,7 @@ when timing matters.
 
 ### The actual priorities in this project
 
-- `esp_timer` dispatch task: priority `22`
+- ESP-IDF `esp_timer` dispatch task (framework-owned): priority `22`
 - `acquisition_task`: priority `10`
 - `processing_task`: priority `9`
 - `control_task`: priority `1`
@@ -480,6 +650,13 @@ when timing matters.
 - **Implementation fact**: the code comments in
   [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:121)
   explicitly describe those choices.
+
+Important clarification:
+
+- the application does **not** assign priority 22 itself
+- what the application chooses is `.dispatch_method = ESP_TIMER_TASK` in
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:291)
+- ESP-IDF then runs the callback in its own higher-priority timer service task
 
 ### What these numbers mean
 
@@ -1018,77 +1195,533 @@ separately and are wired together in the current code.
 - "What is learned versus fixed?"
 - "Why are difficulty modes meaningful?"
 
-## 15. Likely Challenge Questions
+## 15. Likely Challenge Questions with Suggested Answers
 
-### Real-time and timing
+This section is intentionally written as oral-defense material, not just prompts.
+For each likely question, the answer is phrased in a way you can actually say,
+and the code anchors tell you what to point at if they ask for proof.
 
-**Q: Why is this real-time?**  
-Because acquisition is a periodic job with a 10 ms deadline, driven by a timer
-and semaphore path, not by "run whenever convenient."
+### 15.1 Real-time and timing
 
-**Q: How do you prove 100 Hz?**  
-Show the `esp_timer_start_periodic(..., 10000)` call, the acquisition timing log,
-the proof pin toggle, and the timing monitor.
+**Q: Why is this real-time?**
 
-**Q: Is the 20 Hz JSON stream your sample rate?**  
-No. JSON is decimated telemetry. The internal acquisition and processing cadence
-is 100 Hz.
+**Suggested answer**  
+This project is real-time because it has a repeated time-critical job with a fixed
+deadline: sensor acquisition every 10 ms. The timer creates the schedule, the
+semaphore wakes the acquisition task, and the acquisition task has to complete one
+sample cycle per tick. It is not just “running fast”; it is deadline-driven.
 
-### Multitasking and dual-core
+**Code to point at**
+- timer setup:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:288)
+- semaphore give:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:147)
+- acquisition wait:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:329)
 
-**Q: Where exactly is the multitasking?**  
-On Core 0: `control_task` is the low-priority task, and timer/acquisition work
-preempts it every 10 ms.
+**Q: How do you prove the system is 100 Hz?**
 
-**Q: How do you know the multitasking proof is not fake?**  
-Because the low-priority task is a real project task, and the proof dashboard
-displays live firmware instrumentation assembled from raw event timestamps.
+**Suggested answer**  
+The strongest proof is the timer configuration itself: `esp_timer_start_periodic(..., 10000)`
+means a 10,000 microsecond period, which is 10 ms, or 100 Hz. Then the repo adds
+secondary evidence: a measured-rate log in firmware, a proof GPIO toggle for
+external observation, a host-side timing monitor, and an `actual_hz` field in the
+runtime JSON.
 
-**Q: What is the difference between multitasking and dual-core here?**  
-Multitasking is same-core preemption on Core 0. Dual-core is the Core 0 / Core 1
-parallel split with a queue between them.
+**Code to point at**
+- timer period:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:297)
+- measured-rate log:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:389)
+- proof pin toggle:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:145)
+- host monitor:
+  [tests/dual_core_monitor.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/dual_core_monitor.py:254)
+- JSON field:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1117)
 
-### DSP and sensing
+**Q: Is the 20 Hz JSON stream your sample rate?**
 
-**Q: Why Butterworth?**  
-Smooth passband, practical IIR implementation, efficient on embedded hardware,
-and appropriate for smoothing and tremor isolation.
+**Suggested answer**  
+No. The internal acquisition and processing cadence is 100 Hz. The JSON stream is
+intentionally decimated to 20 Hz by transmitting every 5th sample so that host
+telemetry does not dominate serial bandwidth or interfere with runtime behavior.
 
-**Q: Why 6-12 Hz tremor band?**  
-Because the current design uses that band as the tremor indicator, and the
-runtime and calibration code explicitly shape features around it.
+**Code to point at**
+- 20 Hz emission logic:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1098)
+- TX buffer rationale:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:83)
 
-**Q: Why 100 Hz instead of 50 Hz?**  
-100 Hz gives more comfortable headroom for the 6-12 Hz motion band, better time
-resolution, and the codebase is already designed and budgeted around it.
+**Q: What exactly is the deadline?**
 
-### Host and tooling
+**Suggested answer**  
+The deadline is that the acquisition side has to keep up with one full sample cycle
+per 10 ms timer tick. That means ADC reads, IMU read attempt, sample packaging,
+and queue handoff all have to stay within that periodic schedule.
 
-**Q: Why Python instead of LabVIEW?**  
-Because the host side needed a GUI, proof dashboard, diagnostics, serial parsing,
-and source-reviewable tooling around a JSON protocol. Python unified all of that
-in one codebase.
+**Code to point at**
+- acquisition loop stages:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:325)
 
-**Q: Why JSON if bandwidth is limited?**  
-Because readability and inspectability mattered on the host boundary, and the
-design controls bandwidth by throttling normal telemetry to 20 Hz.
+### 15.2 Interrupts, async sources, and event design
 
-### Calibration and thresholds
+**Q: What are your three interrupts or asynchronous event sources?**
 
-**Q: What exactly is calibrated?**  
-Gyro bias, neutral pose, no-pressure force baseline, contact thresholds, grip
-reference force, tremor baseline, and normal-motion references.
+**Suggested answer**  
+The three important asynchronous sources are the periodic `esp_timer` trigger,
+UART0 host-command receive events, and the UART2 IMU serial data path. The timer
+drives the 100 Hz cadence, UART0 brings in commands from the host, and the IMU
+produces serial bytes independently of the application flow.
 
-**Q: What is fixed versus personalized?**  
-Personalized values come from calibration. Difficulty constants and some floors
-come from fixed configuration. Runtime logic combines both.
+**Code to point at**
+- timer callback:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:137)
+- UART0 event queue install:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:98)
+- UART0 event consumption:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:133)
+- IMU UART config:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:271)
+- IMU packet read:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:165)
 
-### Limitations and next steps
+**Q: Are those three things explicit application ISRs you wrote yourselves?**
 
-**Q: What would you improve next?**  
-A stronger answer is: validate thresholds on more users, formalize empirical
-tuning, consider binary or packed telemetry if bandwidth becomes limiting, and
-continue integrating motor feedback as a complete closed-loop coaching path.
+**Suggested answer**  
+No. The more accurate statement is that they are three asynchronous or
+interrupt-driven paths in the system. The timer path uses ESP-IDF timer
+infrastructure, UART0 uses the driver event queue, and UART2 is an asynchronous
+serial receive path whose data is consumed from the driver buffer by
+`acquisition_task`.
+
+**Code to point at**
+- timer dispatch mode:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:291)
+- UART0 event queue:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:98)
+- UART2 byte-drain path:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:165)
+
+**Q: Is a stop command itself an interrupt?**
+
+**Suggested answer**  
+No. A stop command is one meaning of UART0 data arrival. The asynchronous source is
+the UART receive event; “stop” is just one command interpreted from that event.
+
+**Code to point at**
+- UART event handling:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:137)
+- stop command dispatch:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:101)
+
+**Q: If the IMU is read from the acquisition task, why do you still call it asynchronous?**
+
+**Suggested answer**  
+Because the IMU produces serial bytes independently of the main application flow.
+The firmware then consumes those bytes from the UART driver buffer during the next
+acquisition cycle. So the peripheral data arrival is asynchronous even though the
+application-side read is scheduled.
+
+**Code to point at**
+- IMU byte drain:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:168)
+
+**Q: Why is the IMU UART path asynchronous but the FSR path is not?**
+
+**Suggested answer**  
+Because the BNO085 pushes serial data toward the ESP32 on its own, so UART2 sees
+bytes arriving independently of the main application flow. The FSR sensors do not
+push packets or events. They are analog voltages, so the firmware samples them
+when the 10 ms acquisition cycle runs.
+
+**Code to point at**
+- IMU UART config:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:271)
+- FSR ADC read path:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:336)
+
+### 15.3 Multitasking and scheduling
+
+**Q: Where exactly is the multitasking in your project?**
+
+**Suggested answer**  
+The strongest class-definition multitasking example is on Core 0. `control_task`
+is the real low-priority project task, and every 10 ms the higher-priority
+timer/acquisition chain interrupts it. After acquisition finishes, that same
+control task resumes.
+
+**Code to point at**
+- low-priority control role:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:15)
+- proof-mode runnable control task:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:168)
+- timer/semaphore/acq events:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:140)
+
+**Q: How do you know the multitasking proof is not fake?**
+
+**Suggested answer**  
+Because the low-priority task is a real project task that already exists for UART
+and control-plane work. The proof path does not invent a fake task; it instruments
+the real one. Also, the host dashboard is not guessing from packet timing. Core 1
+assembles proof snapshots from raw firmware event timestamps.
+
+**Code to point at**
+- control task is real project work:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:18)
+- proof snapshots built from raw events:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:344)
+- host does not re-derive timing:
+  [tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py:262)
+
+**Q: Why does `control_task` exist at all?**
+
+**Suggested answer**  
+Because UART command ingress, mode changes, calibration control, and proof-mode
+coordination are real project responsibilities, but they should not live inside the
+hard-real-time acquisition loop. Separating them into a low-priority control-plane
+task is cleaner architecturally and also gives an honest multitasking story.
+
+**Code to point at**
+- control responsibilities:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:15)
+- control-to-processing intent messages:
+  [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:32)
+
+**Q: What would break if the priorities were wrong?**
+
+**Suggested answer**  
+If control were too high, it could delay the sampling path on Core 0. If the timer
+dispatch context were not above acquisition, the release event itself could slip.
+If acquisition were not above control, the multitasking proof would also be weaker
+because the real-time job would no longer clearly outrank low-priority work.
+
+**Code to point at**
+- priority rationale:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:121)
+
+**Q: Do you set timer priority 22 yourself?**
+
+**Suggested answer**  
+No. The application does not assign that value directly. What it chooses is
+`ESP_TIMER_TASK` dispatch mode. ESP-IDF then runs the callback in its framework
+timer service task, which sits above the project tasks and can release
+`acquisition_task` on time.
+
+**Code to point at**
+- dispatch mode selection:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:291)
+- rationale comment in app code:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:125)
+
+### 15.4 Dual-core architecture
+
+**Q: What is the difference between multitasking and dual-core parallelism here?**
+
+**Suggested answer**  
+Multitasking is the same-core preemption story on Core 0: a low-priority task is
+interrupted by higher-priority work. Dual-core parallelism is the hardware split:
+Core 0 handles acquisition and control, while Core 1 handles processing and output.
+
+**Code to point at**
+- task pinning:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:144)
+- Core 1 consumer loop:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:828)
+
+**Q: Why not do everything on one core?**
+
+**Suggested answer**  
+Because acquisition has a fixed 10 ms cadence, while processing, calibration, and
+JSON formatting have more variable latency. Splitting them across cores gives timing
+isolation so heavier processing does not directly compete with the acquisition
+deadline.
+
+**Code to point at**
+- queue split and rationale:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:59)
+- processing runs separately on Core 1:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:837)
+
+**Q: Why use a queue instead of shared globals?**
+
+**Suggested answer**  
+The queue makes the ownership boundary explicit: Core 0 produces complete
+`raw_sample_t` packets, Core 1 consumes copies of them. That avoids ad hoc shared
+mutable state and lets FreeRTOS provide the synchronization.
+
+**Code to point at**
+- queue copy semantics:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:43)
+- queue producer/consumer description:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:61)
+
+**Q: What happens if Core 1 falls behind?**
+
+**Suggested answer**  
+The queue depth gives Core 1 some slack, but not unlimited slack. At 100 Hz with a
+10-deep queue, Core 1 has about 100 ms of backlog tolerance before Core 0 starts
+dropping the oldest sample and posting the newest one instead.
+
+**Code to point at**
+- queue depth rationale:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:69)
+- oldest-sample drop/replacement logic:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:383)
+
+### 15.5 FreeRTOS and tasking model
+
+**Q: Why use FreeRTOS instead of one polling loop?**
+
+**Suggested answer**  
+FreeRTOS gave the project a cleaner separation of concerns: a timer-driven
+acquisition task, a low-priority control task, a queue-based Core 1 processing
+task, and well-defined blocking behavior. A single polling loop would mix
+time-critical and variable-latency work much more tightly.
+
+**Code to point at**
+- tasking model assembly:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:113)
+- processing blocks on queue:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:855)
+
+**Q: What did FreeRTOS actually buy you here?**
+
+**Suggested answer**  
+It bought deterministic wakeups, explicit priorities, safe queue handoff, and a
+clean distinction between blocking and active work. In this design, that matters
+more than raw speed because the architecture depends on scheduling semantics.
+
+**Code to point at**
+- semaphore wake path:
+  [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:329)
+- queue receive:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:862)
+
+### 15.6 Signal processing and feature extraction
+
+**Q: Why Butterworth instead of a moving average?**
+
+**Suggested answer**  
+A moving average can smooth noise, but it does not give the same frequency-shaping
+control. This project needed both smoothing and tremor-band isolation. Butterworth
+IIR sections give a smooth passband and practical embedded implementation, and the
+repo uses both low-pass and band-pass stages.
+
+**Code to point at**
+- low-pass and band-pass definitions:
+  [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:26)
+  and [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:47)
+
+**Q: Are you actually implementing the filters yourselves?**
+
+**Suggested answer**  
+Yes. The filter primitive is a Direct Form II Transposed biquad implemented in
+`biquad_step(...)`, and the project defines fixed coefficients for the 10 Hz,
+12 Hz, and 6-12 Hz filters directly in the code.
+
+**Code to point at**
+- biquad implementation:
+  [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c:15)
+
+**Q: Why 6-12 Hz for tremor?**
+
+**Suggested answer**  
+Because the current project defines that as the tremor band of interest, and the
+runtime and calibration logic are both built around that same band so the signal
+processing and threshold logic stay consistent.
+
+**Code to point at**
+- band-pass definition:
+  [main/filters.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.h:32)
+- tremor application:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:888)
+
+**Q: What actual features are you computing beyond raw force and gyro?**
+
+**Suggested answer**  
+The project computes filtered force sum, force derivative, angular-speed RMS,
+tremor RMS, tremor ratio, `f95`, force coefficient of variation, roll/pitch
+excursion, swing rate, contact state, engagement gate, warn/error bitmasks, and a
+running score.
+
+**Code to point at**
+- feature extraction block:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:918)
+- warning/error logic:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1011)
+
+### 15.7 Sampling-rate and telemetry design
+
+**Q: Why 100 Hz instead of 50 Hz?**
+
+**Suggested answer**  
+Because the DSP and window sizes are designed around 100 Hz, the tremor band of
+interest is 6-12 Hz, and 100 Hz gives comfortable headroom above Nyquist while
+still leaving enough compute budget for the runtime pipeline.
+
+**Code to point at**
+- filter sample-rate assumptions:
+  [main/filters.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.h:27)
+- 100 Hz windows:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:58)
+- DFT budget:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:514)
+
+**Q: Why not 200 Hz?**
+
+**Suggested answer**  
+At the current project scope, 200 Hz would increase compute and serial pressure
+without a clearly justified benefit. The present feature set already fits the 100 Hz
+budget well, and the codebase is tuned around that rate.
+
+**Code to point at**
+- current rate assumptions throughout processing:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:834)
+
+**Q: Why JSON if bandwidth is limited?**
+
+**Suggested answer**  
+Because JSON is the host boundary, not the control loop. It is human-readable,
+easy to inspect and parse in Python, and easy to extend. Bandwidth is managed by
+only transmitting every fifth sample and by using the UART TX buffer to absorb
+bursts.
+
+**Code to point at**
+- TX buffer rationale:
+  [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:83)
+- JSON packet assembly:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1104)
+
+### 15.8 Python vs LabVIEW
+
+**Q: Why Python instead of LabVIEW?**
+
+**Suggested answer**  
+Because the host side had to be more than a display. It had to support structured
+JSON parsing, a full GUI, calibration orchestration, subsystem diagnostics, and a
+multitasking proof dashboard. Python let the project use one version-controlled,
+scriptable host stack for all of those roles against the same UART/JSON protocol.
+
+**Code to point at**
+- GUI role:
+  [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:4)
+- FSR diagnostic:
+  [tests/fsr_test.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/fsr_test.py:3)
+- IMU diagnostic:
+  [tests/imu_test.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/imu_test.py:3)
+- proof dashboard:
+  [tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py:3)
+
+**Q: What do you gain technically from Python?**
+
+**Suggested answer**  
+Unified tooling, reusable parsers, scriptable diagnostics, source-reviewable host
+logic, and easy extension of the protocol consumer without introducing a second
+host-toolchain model.
+
+**Code to point at**
+- GUI packet routing:
+  [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:2319)
+
+### 15.9 Calibration and thresholds
+
+**Q: What exactly is calibrated?**
+
+**Suggested answer**  
+The project calibrates IMU bias and neutral pose, a no-motion tremor baseline,
+FSR baseline mean and sigma, contact on/off thresholds, a reference grip force,
+and normal-motion references like broadband RMS, tremor-band ratio, and motion
+excursion values.
+
+**Code to point at**
+- calibration state fields:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:67)
+- C1:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1039)
+- C2:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1136)
+- C3:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1217)
+- C4:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1253)
+
+**Q: What is learned versus fixed?**
+
+**Suggested answer**  
+The personalized baseline values are learned in calibration. The mode constants,
+some threshold floors, and the structure of the warn/error logic are fixed in the
+code. Runtime scoring combines both: learned baselines plus fixed policy.
+
+**Code to point at**
+- calibrated fields:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:68)
+- fixed difficulty constants:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:121)
+
+**Q: How are contact thresholds computed?**
+
+**Suggested answer**  
+They are learned in C2 from the no-pressure baseline. The code computes candidate
+thresholds as `mu + 5*sigma` for contact-on and `mu + 3*sigma` for contact-off,
+then applies minimum floors so the thresholds do not collapse unrealistically low.
+
+**Code to point at**
+- C2 threshold calculation:
+  [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1180)
+
+**Q: How are easy, medium, and hard actually defined?**
+
+**Suggested answer**  
+They are defined by fixed difficulty constants that scale allowable force, tremor,
+hold instability, force variability, force spikes, and score penalties. The modes
+do not just rename one threshold; they retune several tolerance dimensions at once.
+
+**Code to point at**
+- difficulty constants:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:121)
+- difficulty application:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:587)
+
+**Q: How is the score updated?**
+
+**Suggested answer**  
+The runtime computes warning and error bitmasks first. Then warnings subtract the
+warning penalty and errors subtract the error penalty, with penalty size depending
+on the selected difficulty.
+
+**Code to point at**
+- warn/error bitmasks:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1011)
+- score update:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1089)
+
+### 15.10 Limits, failure modes, and next steps
+
+**Q: What are the main current limitations?**
+
+**Suggested answer**  
+The thresholds and difficulty scaling are code-grounded and calibrated, but they
+still need broader user validation. The host telemetry is intentionally throttled,
+which is good for runtime but means it is not a full-rate raw data logger. Motor
+feedback is wired in but not yet the main finished user-facing loop.
+
+**Code to point at**
+- difficulty constants:
+  [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h:121)
+- telemetry throttling:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1098)
+- motor pulses:
+  [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1083)
+
+**Q: What would you improve next?**
+
+**Suggested answer**  
+I would validate thresholds across more users, formalize empirical tuning, add
+clearer benchmark datasets for calibration and scoring evaluation, consider more
+compact telemetry if the host link becomes a bottleneck, and continue integrating
+the motor-feedback path into a stronger closed-loop coaching experience.
 
 ## 16. Fast Reference: Best Screenshot Anchors
 

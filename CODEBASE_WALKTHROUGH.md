@@ -56,6 +56,12 @@ More concretely:
   and scoring pipeline for each sample.
 - Every 5th sample, Core 1 emits JSON to the host at 20 Hz.
 
+Important nuance:
+
+- the application selects `.dispatch_method = ESP_TIMER_TASK`
+- the ESP-IDF framework then runs the callback in its timer service context
+- the project does **not** assign that framework task priority directly in its own code
+
 The queue between cores is intentionally the only inter-core data path for live
 sensor samples.
 
@@ -107,6 +113,15 @@ The proof dashboard in
 [tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py)
 shows that chain as `CTRL -> T -> S -> W -> D -> CTRL`.
 
+What this is **not**:
+
+- it is not just "the ESP32 has two cores"
+- it is not just "multiple tasks exist in FreeRTOS"
+
+The stricter claim is that a real low-priority project task on Core 0 is
+preempted by higher-priority work and then resumes. That is the cleanest
+multitasking proof in the codebase.
+
 ## Where Parallelism Happens
 
 Parallelism is the **Core 0 / Core 1 split**, not the same thing as the
@@ -131,10 +146,20 @@ The three important asynchronous sources in this project are:
    - the BNO085 sends UART-RVC bytes asynchronously; `acquisition_task`
      reads and decodes the driver buffer each cycle
 
+Plain-English picture:
+
+- the timer is what kicks off the real-time 10 ms schedule
+- UART0 is how the host GUI interrupts the control plane with commands
+- UART2 is the dedicated serial line used to receive motion data from the IMU
+
 Important nuance:
 
 - a `STOP` command is not a separate interrupt source
 - it is one example of a UART0 host command
+- `acquisition_task` is not itself the IMU interrupt; it is the software task
+  that consumes the asynchronously arriving UART2 data
+- the FSR sensors are not asynchronous serial sources; the firmware samples
+  them directly through the ADC on each timer-driven cycle
 
 ## DSP and Telemetry
 
@@ -161,7 +186,8 @@ formatting choice:
 
 - the host still gets live feedback
 - UART bandwidth stays manageable
-- Core 0 is protected from serial-output backpressure
+- Core 0 is protected from serial-output backpressure because telemetry is
+  decimated and the UART driver TX ring buffer absorbs short bursts
 
 Proof-mode snapshots use the same idea: Core 0 emits compact raw events, but
 Core 1 assembles and serializes the human-readable dashboard packets.

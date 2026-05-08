@@ -26,16 +26,17 @@ For a deeper developer-facing map of the repo, see
 5. [Hardware Guide](#hardware-guide)
 6. [Firmware Architecture](#firmware-architecture)
 7. [Real-Time Behavior](#real-time-behavior)
-8. [Multitasking Behavior](#multitasking-behavior)
-9. [Code Tour by Subsystem](#code-tour-by-subsystem)
-10. [Calibration Guide](#calibration-guide)
-11. [Scoring and Warning Logic](#scoring-and-warning-logic)
-12. [UART Protocol and Telemetry](#uart-protocol-and-telemetry)
-13. [GUI Guide](#gui-guide)
-14. [Build, Flash, and Run](#build-flash-and-run)
-15. [Diagnostic Tools](#diagnostic-tools)
-16. [How to Modify the Project](#how-to-modify-the-project)
-17. [Troubleshooting](#troubleshooting)
+8. [Asynchronous Event Sources](#asynchronous-event-sources)
+9. [Multitasking Behavior](#multitasking-behavior)
+10. [Code Tour by Subsystem](#code-tour-by-subsystem)
+11. [Calibration Guide](#calibration-guide)
+12. [Scoring and Warning Logic](#scoring-and-warning-logic)
+13. [UART Protocol and Telemetry](#uart-protocol-and-telemetry)
+14. [GUI Guide](#gui-guide)
+15. [Build, Flash, and Run](#build-flash-and-run)
+16. [Diagnostic Tools](#diagnostic-tools)
+17. [How to Modify the Project](#how-to-modify-the-project)
+18. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -238,6 +239,14 @@ Important implications:
 - the firmware does **not** currently use a UART2 event queue for IMU input
 - the acquisition task reads the IMU directly each cycle
 
+Plain-English picture:
+
+- the **IMU** is the motion sensor; it tells the system how the hand is moving
+- **UART2** is the separate serial connection the ESP32 uses to listen to that sensor
+- this is separate from **UART0**, which is used for host GUI commands and telemetry
+- this is also different from the FSR sensors, which do not "send packets" on their own;
+  the firmware actively samples them through the ADC every 10 ms
+
 Required wiring:
 
 - ESP32 3.3 V -> BNO085 VIN
@@ -316,6 +325,19 @@ The two cores communicate through one FreeRTOS queue:
 This is the clean boundary in the firmware. If you want to understand the system, learn
 that struct and the producer-consumer relationship first.
 
+### Plain-English workflow
+
+If you need to explain the runtime without sounding like you are reciting file names,
+say it this way:
+
+1. every 10 ms, a timer event releases the acquisition path on Core 0
+2. Core 0 reads the FSR sensors and checks for fresh IMU data
+3. Core 0 packages one `raw_sample_t` and pushes it into the queue
+4. Core 1 receives that sample, filters it, and updates state, warnings, and score
+5. every 5th sample, Core 1 emits one JSON packet to the host GUI
+
+That is the simplest accurate mental model of the system.
+
 ---
 
 ## Real-Time Behavior
@@ -338,9 +360,15 @@ The repeated time-critical task is **sensor acquisition at 100 Hz**.
 The firmware uses an `esp_timer` periodic callback every 10,000 microseconds.
 That callback:
 
-- runs via `ESP_TIMER_TASK`
+- is dispatched via `ESP_TIMER_TASK`
 - gives `s_timer_sem`
 - wakes `acquisition_task`
+
+Important nuance:
+
+- our application chooses the **dispatch mode** (`ESP_TIMER_TASK`)
+- the ESP-IDF framework provides the high-priority timer service context
+- we do **not** assign that framework task priority ourselves in application code
 
 Then `acquisition_task`:
 
@@ -351,6 +379,15 @@ Then `acquisition_task`:
 - sends that sample to the queue
 
 The important point is that the acquisition task is driven by a fixed schedule.
+The timer defines the 10 ms cadence; acquisition performs the time-critical work
+inside that cadence.
+
+Another important nuance:
+
+- the timer period is 10 ms
+- `acquisition_task` is released every 10 ms
+- `acquisition_task` does **not** run for the full 10 ms; it runs only long enough
+  to complete one sample cycle and then blocks again
 
 ### Why this is real-time
 
@@ -370,6 +407,37 @@ It is **not** merely:
 - updating the GUI quickly
 
 Those help, but they are not the definition of real-time.
+
+---
+
+## Asynchronous Event Sources
+
+The three important asynchronous or interrupt-driven paths in the current system are:
+
+1. **the periodic `esp_timer` trigger**
+   - this is the 100 Hz timing source
+2. **UART0 host command receive events**
+   - commands such as `STOP`, `EXIT`, `E`, `M`, `H`, and `C1`-`C4` arrive this way
+3. **UART2 IMU serial data arrival**
+   - the BNO085 sends UART-RVC bytes independently of the main application flow
+
+The easiest plain-English explanation is:
+
+- the timer interrupts the normal flow every 10 ms to release acquisition
+- the host GUI can interrupt the control path by sending UART0 commands
+- the IMU can produce fresh serial data independently of both of those
+
+Important distinctions:
+
+- a `STOP` command is **not** a separate interrupt type; it is one meaning of UART0 data arrival
+- `acquisition_task` is **not** the IMU interrupt; it is the task that consumes the
+  asynchronously arriving UART2 data
+- the FSR sensors are **not** asynchronous event sources in the same sense; the firmware
+  polls their analog values on schedule rather than receiving pushed packets from them
+
+If someone asks whether these are "three ISRs we wrote ourselves," the honest answer is no.
+They are better described as **three asynchronous event sources / interrupt-driven paths**
+used by the implementation.
 
 ---
 
@@ -396,6 +464,19 @@ The important class-definition example is on **Core 0**:
 
 That means a lower-priority **project-owned** task is genuinely interrupted by
 higher-priority work on the same CPU core.
+
+### The misconception to avoid
+
+One easy mistake is to say that the project proves multitasking simply because the ESP32
+has two cores. That is not the strongest explanation.
+
+- **dual-core use** proves parallelism
+- **same-core preemption** proves the class-definition multitasking story
+
+The stronger defense is therefore:
+
+- Core 0 proves multitasking, because `control_task` is interrupted by the timer/acquisition path
+- Core 1 proves parallelism, because processing runs on a physically separate CPU core
 
 ### Why that distinction matters
 
@@ -449,11 +530,12 @@ If you want to understand how the application is assembled, `main.c` is the entr
 
 Jump into code:
 
-- [`main/main.c`](main/main.c) — top-level startup file
-- `app_main()` starts around line 29
-- queue creation is around lines 58-74
-- UART0 driver install is around lines 81-103
-- `xTaskCreatePinnedToCore(...)` calls are around lines 143-166
+- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:30) — `app_main()`
+- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:59) — inter-core queue creation
+- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:99) — UART0 driver install
+- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:144) — acquisition task pinning/priority
+- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:152) — control task pinning/priority
+- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:160) — processing task pinning/priority
 
 ### 2. `main/acquisition.c` and `main/acquisition.h` — Core 0 data acquisition
 
@@ -479,13 +561,11 @@ That last point is important: the code prefers **fresh data** over backlog.
 
 Jump into code:
 
-- [`main/acquisition.c`](main/acquisition.c) — acquisition implementation
-- [`main/acquisition.h`](main/acquisition.h) — acquisition design notes and public API
-- `timer_isr_cb()` starts around line 93
-- `acquisition_init()` starts around line 197
-- `acquisition_task()` starts around line 254
-- the ADC-to-force sampling loop is around lines 282-290
-- the UART-RVC read and gyro derivation logic is around lines 299-321
+- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:137) — `timer_isr_cb()`
+- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:247) — `acquisition_init()`
+- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:307) — `acquisition_task()`
+- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:336) — per-cycle acquisition steps
+- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:165) — UART-RVC packet drain/decode helper
 
 ### 3. `main/control.c` and `main/control.h` — Core 0 control plane
 
@@ -505,10 +585,9 @@ Core 1 signal-processing path.
 
 Jump into code:
 
-- [`main/control.c`](main/control.c) — control-plane implementation
-- [`main/control.h`](main/control.h) — control-plane interface
-- `dispatch_command(...)` starts around line 119
-- `control_task()` starts around line 229
+- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:50) — `dispatch_command(...)`
+- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:133) — UART0 event consumption
+- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:163) — `control_task()`
 
 ### 4. `main/processing.c` and `main/processing.h` — Core 1 interpretation
 
@@ -529,14 +608,12 @@ the file you will spend the most time in.
 
 Jump into code:
 
-- [`main/processing.c`](main/processing.c) — runtime logic
-- [`main/processing.h`](main/processing.h) — module interface
-- `processing_init(...)` starts around line 421
-- `processing_task()` starts around line 506
-- per-axis tremor band-pass filtering is around lines 558-566
-- engagement and board-state logic is around lines 624-679
-- warning/error logic starts around line 681
-- JSON telemetry formatting starts around line 843
+- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:740) — `processing_init(...)`
+- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:841) — `processing_task()`
+- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:888) — tremor band-pass filtering
+- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:954) — engagement and board-state logic
+- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1011) — warning/error logic
+- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1098) — JSON telemetry output
 
 ### 5. `main/calibration.c` and `main/calibration.h` — guided personalization
 
@@ -555,13 +632,11 @@ four-step version above.
 
 Jump into code:
 
-- [`main/calibration.c`](main/calibration.c) — calibration implementation
-- [`main/calibration.h`](main/calibration.h) — calibration API and step definitions
-- `cal_c1(...)` starts around line 1030
-- `cal_c2(...)` starts around line 1123
-- `cal_c3_grip(...)` starts around line 1202
-- `cal_c4_motion(...)` starts around line 1236
-- `calibration_run(...)` starts around line 1283
+- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1039) — `cal_c1(...)`
+- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1136) — `cal_c2(...)`
+- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1217) — `cal_c3_grip(...)`
+- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1253) — `cal_c4_motion(...)`
+- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1302) — `calibration_run(...)`
 
 ### 5. `main/filters.c` and `main/filters.h` — signal-processing primitives
 
@@ -629,10 +704,9 @@ If you want to change the wording, labels, calibration flow, or GUI behavior, st
 
 Jump into code:
 
-- [`gui/esp32_controller.py`](gui/esp32_controller.py)
-- `CALIBRATION_STEPS` starts around line 95
-- the active calibration order `CORE_CALIBRATION_FLOW` is around line 146
-- C3/C4 stage-event handling is around lines 1011-1117
+- [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:123) — `CALIBRATION_STEPS`
+- [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:174) — `CORE_CALIBRATION_FLOW`
+- [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:1092) — C3/C4 stage-event handling
 
 ### 9. `gui/hand_visualizer.py` — motion/force visualization
 

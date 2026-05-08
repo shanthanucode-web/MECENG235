@@ -54,7 +54,7 @@ void app_main(void)
         printf("CAL: using defaults\r\n");
     }
 
-    printf("Interrupts: Timer ISR | BNO085 INT | UART RX\r\n");
+    printf("Async paths: esp_timer | UART0 RX | UART2 RX\r\n");
 
     /* ── Inter-core queue ───────────────────────────────────────────── */
     /*
