@@ -13,7 +13,7 @@ This README is intentionally written as both:
 The project is implemented natively with ESP-IDF on the ESP32. It does not use Arduino.
 
 For a deeper developer-facing map of the repo, see
-[CODEBASE_WALKTHROUGH.md](/Users/shanthanu/uart_echo_VitalSignsLab4/CODEBASE_WALKTHROUGH.md).
+[CODEBASE_WALKTHROUGH.md](CODEBASE_WALKTHROUGH.md).
 
 ---
 
@@ -156,8 +156,6 @@ Python GUI
   - status panels
   - hand visualizer
 ```
-
-![Firmware architecture overview](docs/firmware_architecture.svg)
 
 ### End-to-end story
 
@@ -530,12 +528,12 @@ If you want to understand how the application is assembled, `main.c` is the entr
 
 Jump into code:
 
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:30) — `app_main()`
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:59) — inter-core queue creation
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:99) — UART0 driver install
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:144) — acquisition task pinning/priority
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:152) — control task pinning/priority
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c:160) — processing task pinning/priority
+- [main/main.c](main/main.c:30) — `app_main()`
+- [main/main.c](main/main.c:59) — inter-core queue creation
+- [main/main.c](main/main.c:99) — UART0 driver install
+- [main/main.c](main/main.c:144) — acquisition task pinning/priority
+- [main/main.c](main/main.c:152) — control task pinning/priority
+- [main/main.c](main/main.c:160) — processing task pinning/priority
 
 ### 2. `main/acquisition.c` and `main/acquisition.h` — Core 0 data acquisition
 
@@ -561,11 +559,11 @@ That last point is important: the code prefers **fresh data** over backlog.
 
 Jump into code:
 
-- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:137) — `timer_isr_cb()`
-- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:247) — `acquisition_init()`
-- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:307) — `acquisition_task()`
-- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:336) — per-cycle acquisition steps
-- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c:165) — UART-RVC packet drain/decode helper
+- [main/acquisition.c](main/acquisition.c:137) — `timer_isr_cb()`
+- [main/acquisition.c](main/acquisition.c:247) — `acquisition_init()`
+- [main/acquisition.c](main/acquisition.c:307) — `acquisition_task()`
+- [main/acquisition.c](main/acquisition.c:336) — per-cycle acquisition steps
+- [main/acquisition.c](main/acquisition.c:165) — UART-RVC packet drain/decode helper
 
 ### 3. `main/control.c` and `main/control.h` — Core 0 control plane
 
@@ -585,9 +583,9 @@ Core 1 signal-processing path.
 
 Jump into code:
 
-- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:50) — `dispatch_command(...)`
-- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:133) — UART0 event consumption
-- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c:163) — `control_task()`
+- [main/control.c](main/control.c:50) — `dispatch_command(...)`
+- [main/control.c](main/control.c:133) — UART0 event consumption
+- [main/control.c](main/control.c:163) — `control_task()`
 
 ### 4. `main/processing.c` and `main/processing.h` — Core 1 interpretation
 
@@ -608,12 +606,12 @@ the file you will spend the most time in.
 
 Jump into code:
 
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:740) — `processing_init(...)`
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:841) — `processing_task()`
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:888) — tremor band-pass filtering
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:954) — engagement and board-state logic
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1011) — warning/error logic
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c:1098) — JSON telemetry output
+- [main/processing.c](main/processing.c:740) — `processing_init(...)`
+- [main/processing.c](main/processing.c:841) — `processing_task()`
+- [main/processing.c](main/processing.c:888) — tremor band-pass filtering
+- [main/processing.c](main/processing.c:954) — engagement and board-state logic
+- [main/processing.c](main/processing.c:1011) — warning/error logic
+- [main/processing.c](main/processing.c:1098) — JSON telemetry output
 
 ### 5. `main/calibration.c` and `main/calibration.h` — guided personalization
 
@@ -632,11 +630,11 @@ four-step version above.
 
 Jump into code:
 
-- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1039) — `cal_c1(...)`
-- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1136) — `cal_c2(...)`
-- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1217) — `cal_c3_grip(...)`
-- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1253) — `cal_c4_motion(...)`
-- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c:1302) — `calibration_run(...)`
+- [main/calibration.c](main/calibration.c:1039) — `cal_c1(...)`
+- [main/calibration.c](main/calibration.c:1136) — `cal_c2(...)`
+- [main/calibration.c](main/calibration.c:1217) — `cal_c3_grip(...)`
+- [main/calibration.c](main/calibration.c:1253) — `cal_c4_motion(...)`
+- [main/calibration.c](main/calibration.c:1302) — `calibration_run(...)`
 
 ### 5. `main/filters.c` and `main/filters.h` — signal-processing primitives
 
@@ -704,9 +702,9 @@ If you want to change the wording, labels, calibration flow, or GUI behavior, st
 
 Jump into code:
 
-- [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:123) — `CALIBRATION_STEPS`
-- [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:174) — `CORE_CALIBRATION_FLOW`
-- [gui/esp32_controller.py](/Users/shanthanu/uart_echo_VitalSignsLab4/gui/esp32_controller.py:1092) — C3/C4 stage-event handling
+- [gui/esp32_controller.py](gui/esp32_controller.py:123) — `CALIBRATION_STEPS`
+- [gui/esp32_controller.py](gui/esp32_controller.py:174) — `CORE_CALIBRATION_FLOW`
+- [gui/esp32_controller.py](gui/esp32_controller.py:1092) — C3/C4 stage-event handling
 
 ### 9. `gui/hand_visualizer.py` — motion/force visualization
 

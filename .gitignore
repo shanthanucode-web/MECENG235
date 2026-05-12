@@ -62,9 +62,15 @@ venv/
 env/
 
 # Language Servers
+.cache/
+.clangd
 .clangd/
 .ccls-cache/
 compile_commands.json
+
+# Local editor and container configuration
+.devcontainer/
+.vscode/
 
 # Windows specific
 Thumbs.db
@@ -80,3 +86,4 @@ Desktop.ini
 #misc
 HapticSurgicalTrainer_final_reviewed_multitasking_fixed.pptx
 CLAUDE.md
+docs/THESIS_DEFENSE_PREP.md

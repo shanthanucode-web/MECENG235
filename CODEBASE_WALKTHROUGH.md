@@ -23,21 +23,21 @@ structured output:
 
 If you are new to the repo, read these files in this order:
 
-1. [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c)
+1. [main/main.c](main/main.c)
    - startup sequence
    - queue creation
    - task creation and core pinning
-2. [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c)
+2. [main/acquisition.c](main/acquisition.c)
    - 100 Hz timer wake path
    - ADC + IMU reads
    - handoff to Core 1
-3. [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c)
+3. [main/control.c](main/control.c)
    - UART0 command ingress
    - low-priority control-plane work
-4. [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c)
+4. [main/processing.c](main/processing.c)
    - filter / state / warning / score / telemetry pipeline
    - multitasking proof snapshot assembly
-5. [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c)
+5. [main/calibration.c](main/calibration.c)
    - blocking calibration stages and their outputs
 
 ## Runtime Data Flow
@@ -110,7 +110,7 @@ multitasking:
 - the low-priority task resumes afterward
 
 The proof dashboard in
-[tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py)
+[tests/multitask_proof.py](tests/multitask_proof.py)
 shows that chain as `CTRL -> T -> S -> W -> D -> CTRL`.
 
 What this is **not**:
@@ -166,7 +166,7 @@ Important nuance:
 ### Butterworth filters
 
 The filter helpers in
-[main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c)
+[main/filters.c](main/filters.c)
 implement fixed-coefficient Butterworth biquad sections for the 100 Hz runtime:
 
 - low-pass 10 Hz for FSR smoothing
@@ -195,7 +195,7 @@ Core 1 assembles and serializes the human-readable dashboard packets.
 ## Calibration Guide
 
 Calibration lives in
-[main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c).
+[main/calibration.c](main/calibration.c).
 
 The important stages are:
 
@@ -221,47 +221,47 @@ Calibration is invoked from the processing side, but it consumes the same
 
 ### Firmware core
 
-- [main/main.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/main.c)
+- [main/main.c](main/main.c)
   - boot path, driver setup, queue creation, and task creation
-- [main/acquisition.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/acquisition.c)
+- [main/acquisition.c](main/acquisition.c)
   - Core 0 hardware init
   - timer callback
   - `acquisition_task()`
   - multitasking-proof raw event emission
-- [main/control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/control.c)
+- [main/control.c](main/control.c)
   - UART0 event handling
   - command parsing and dispatch
   - proof-mode behavior for the real low-priority control task
-- [main/processing.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/processing.c)
+- [main/processing.c](main/processing.c)
   - `processing_task()`
   - control-message handling
   - filter/feature/warning/score pipeline
   - proof-cycle reassembly and snapshot emission
-- [main/calibration.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/calibration.c)
+- [main/calibration.c](main/calibration.c)
   - all user-guided calibration steps and progress telemetry
 
 ### Support modules
 
-- [main/filters.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/filters.c)
+- [main/filters.c](main/filters.c)
   - Butterworth biquad and derivative primitives
-- [main/data_types.h](/Users/shanthanu/uart_echo_VitalSignsLab4/main/data_types.h)
+- [main/data_types.h](main/data_types.h)
   - shared structs, thresholds, GPIO mapping, and protocol constants
-- [main/nvs_storage.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/nvs_storage.c)
+- [main/nvs_storage.c](main/nvs_storage.c)
   - calibration persistence and defaults
-- [main/motor_control.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/motor_control.c)
+- [main/motor_control.c](main/motor_control.c)
   - motor pulse abstraction
-- [main/led_status.c](/Users/shanthanu/uart_echo_VitalSignsLab4/main/led_status.c)
+- [main/led_status.c](main/led_status.c)
   - simple status LED state machine
 
 ### Test / demo tools
 
-- [tests/multitask_proof.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/multitask_proof.py)
+- [tests/multitask_proof.py](tests/multitask_proof.py)
   - enables `MT_ON`, reads proof snapshots, and renders the Core 0 proof
-- [tests/dual_core_monitor.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/dual_core_monitor.py)
+- [tests/dual_core_monitor.py](tests/dual_core_monitor.py)
   - visualises dual-core runtime behavior from normal telemetry
-- [tests/imu_test.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/imu_test.py)
+- [tests/imu_test.py](tests/imu_test.py)
   - validates IMU-related JSON fields
-- [tests/fsr_test.py](/Users/shanthanu/uart_echo_VitalSignsLab4/tests/fsr_test.py)
+- [tests/fsr_test.py](tests/fsr_test.py)
   - validates force-related JSON fields
 
 ## What To Modify For Common Tasks
